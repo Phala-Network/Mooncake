@@ -86,6 +86,10 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     batch_standby_reader_.reset();
     batch_standby_kv_backend_.reset();
     batch_snapshot_baseline_.reset();
+    {
+        std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
+        last_applied_batch_snapshot_prefix_.reset();
+    }
 
     last_error_.store(ErrorCode::OK, std::memory_order_release);
 
@@ -296,6 +300,8 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
         if (cursor_error != ErrorCode::OK) {
             return cursor_error;
         }
+        std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
+        last_applied_batch_snapshot_prefix_ = *batch_snapshot_baseline_;
     }
 
     state_machine_.ProcessEvent(StandbyEvent::SYNC_COMPLETE);
@@ -363,6 +369,9 @@ void HotStandbyService::Stop() {
         return;
     }
 
+    if (current_state != StandbyState::PROMOTED) {
+        NotifySnapshotStop();
+    }
     state_machine_.ProcessEvent(StandbyEvent::STOP);
     StopReplicationLoop();
 
@@ -373,6 +382,56 @@ void HotStandbyService::Stop() {
 
     LOG(INFO) << "HotStandbyService stopped, final_state="
               << StandbyStateToString(GetState());
+}
+
+std::optional<DurablePrefix>
+HotStandbyService::GetLastAppliedBatchOpLogSnapshotPrefix() const {
+    std::lock_guard<std::mutex> lock(batch_snapshot_cursor_mutex_);
+    return last_applied_batch_snapshot_prefix_;
+}
+
+void HotStandbyService::CancelBatchOpLogSnapshotCapture() {
+    CancelSnapshotCapture();
+}
+
+void HotStandbyService::SetBatchOpLogSnapshotCaptureReleasedCallback(
+    SnapshotLifecycleCallback callback) {
+    std::lock_guard<std::mutex> lock(snapshot_lifecycle_callback_mutex_);
+    snapshot_capture_released_callback_ = std::move(callback);
+}
+
+void HotStandbyService::SetBatchOpLogSnapshotPromotionCallback(
+    SnapshotLifecycleCallback callback) {
+    std::lock_guard<std::mutex> lock(snapshot_lifecycle_callback_mutex_);
+    snapshot_promotion_callback_ = std::move(callback);
+}
+
+void HotStandbyService::SetBatchOpLogSnapshotStopCallback(
+    SnapshotLifecycleCallback callback) {
+    std::lock_guard<std::mutex> lock(snapshot_lifecycle_callback_mutex_);
+    snapshot_stop_callback_ = std::move(callback);
+}
+
+void HotStandbyService::NotifySnapshotPromotion() {
+    SnapshotLifecycleCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(snapshot_lifecycle_callback_mutex_);
+        callback = snapshot_promotion_callback_;
+    }
+    if (callback) {
+        callback();
+    }
+}
+
+void HotStandbyService::NotifySnapshotStop() {
+    SnapshotLifecycleCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(snapshot_lifecycle_callback_mutex_);
+        callback = snapshot_stop_callback_;
+    }
+    if (callback) {
+        callback();
+    }
 }
 
 StandbySyncStatus HotStandbyService::GetSyncStatus() const {
@@ -556,6 +615,7 @@ ErrorCode HotStandbyService::Promote() {
 
 ErrorCode HotStandbyService::PromoteLockedInternal(
     uint64_t current_applied_seq_id) {
+    NotifySnapshotPromotion();
     StopReplicationLoop();
     ErrorCode catch_up_err =
         FinalCatchUpForPromotionLocked(current_applied_seq_id);
@@ -731,6 +791,15 @@ void HotStandbyService::EndBatchOpLogSnapshotCapture(
     BatchOpLogSnapshotCapture& capture) {
     if (capture.lease_state_ == snapshot_capture_state_) {
         capture.Release();
+        SnapshotLifecycleCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(
+                snapshot_lifecycle_callback_mutex_);
+            callback = snapshot_capture_released_callback_;
+        }
+        if (callback) {
+            callback();
+        }
     }
 }
 
@@ -834,6 +903,12 @@ void HotStandbyService::ReplicationLoop() {
             const uint64_t expected_before =
                 oplog_applier_->GetExpectedSequenceId();
             auto result = batch_standby_reader_->PollOnce();
+            {
+                std::lock_guard<std::mutex> cursor_lock(
+                    batch_snapshot_cursor_mutex_);
+                last_applied_batch_snapshot_prefix_ =
+                    batch_standby_reader_->GetLastAppliedDurablePrefix();
+            }
             HandleSnapshotCaptureRequest(result);
             if (result.durable_prefix_present) {
                 const uint64_t current_primary = primary_seq_id_.load();
