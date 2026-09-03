@@ -3008,6 +3008,24 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
         return std::make_pair(std::move(tenant_id), std::move(user_key));
     };
 
+    ReplicaID max_live_id = 0;
+    for (const auto& entry : objects) {
+        auto [tenant_id, user_key] = resolve_standby_object(entry);
+        std::unordered_set<ReplicaID> object_replica_ids;
+        for (const auto& desc : entry.metadata.replicas) {
+            if (desc.id == 0 ||
+                desc.id == std::numeric_limits<ReplicaID>::max() ||
+                !object_replica_ids.insert(desc.id).second) {
+                LOG(ERROR)
+                    << "RestoreFromStandbySnapshot: invalid or duplicate "
+                    << "replica id=" << desc.id
+                    << ", tenant=" << tenant_id.value() << ", key=" << user_key;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            max_live_id = std::max(max_live_id, desc.id);
+        }
+    }
+
     std::vector<StandbySegmentInfo> restored_memory_segments;
     std::unordered_map<std::string, const StandbySegmentInfo*>
         memory_segments_by_alias;
@@ -3141,9 +3159,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                 }
 
                 auto alloc = restored_allocators.at(buffer.transport_endpoint_);
-                replicas.emplace_back(
-                    std::make_unique<AllocatedBuffer>(alloc, buffer),
-                    desc.status);
+                replicas.push_back(Replica(
+                    desc.id, std::make_unique<AllocatedBuffer>(alloc, buffer),
+                    desc.status));
             } else if (desc.is_nof_replica()) {
                 const auto& buffer =
                     desc.get_nof_descriptor().buffer_descriptor;
@@ -3158,9 +3176,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                     alloc = std::make_shared<DummyBufferAllocator>(
                         buffer.transport_endpoint_, buffer.transport_endpoint_);
                 }
-                replicas.emplace_back(
-                    std::make_unique<AllocatedBuffer>(alloc, buffer),
-                    desc.status, ReplicaType::NOF_SSD);
+                replicas.push_back(Replica(
+                    desc.id, std::make_unique<AllocatedBuffer>(alloc, buffer),
+                    desc.status, ReplicaType::NOF_SSD));
             } else if (desc.is_disk_replica()) {
                 const auto& disk_desc = desc.get_disk_descriptor();
                 if (disk_desc.object_size != standby_meta.size) {
@@ -3169,9 +3187,9 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                                << ", key=" << user_key;
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 }
-                replicas.emplace_back(disk_desc.file_path,
-                                      disk_desc.object_size, desc.status);
-            } else {
+                replicas.push_back(Replica(desc.id, disk_desc.file_path,
+                                           disk_desc.object_size, desc.status));
+            } else if (desc.is_local_disk_replica()) {
                 const auto& local_disk_desc = desc.get_local_disk_descriptor();
                 if (local_disk_desc.object_size != standby_meta.size) {
                     LOG(ERROR)
@@ -3180,9 +3198,15 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                         << ", key=" << user_key;
                     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 }
-                replicas.emplace_back(
-                    local_disk_desc.client_id, local_disk_desc.object_size,
-                    local_disk_desc.transport_endpoint, desc.status);
+                replicas.push_back(Replica(desc.id, local_disk_desc.client_id,
+                                           local_disk_desc.object_size,
+                                           local_disk_desc.transport_endpoint,
+                                           desc.status));
+            } else {
+                LOG(ERROR) << "RestoreFromStandbySnapshot: unsupported replica "
+                           << "descriptor, tenant=" << tenant_id.value()
+                           << ", key=" << user_key;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
         }
         objects_by_shard[shard_idx].push_back({&entry, std::move(tenant_id),
@@ -3248,6 +3272,15 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                                     object.user_key, standby_meta.group_id);
             }
             tenant_state.processing_keys.erase(object.user_key);
+        }
+    }
+
+    if (max_live_id != 0) {
+        const ReplicaID desired_next_id = max_live_id + 1;
+        ReplicaID current_next_id = Replica::next_id_.load();
+        while (current_next_id < desired_next_id &&
+               !Replica::next_id_.compare_exchange_weak(current_next_id,
+                                                        desired_next_id)) {
         }
     }
 
