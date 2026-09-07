@@ -38,6 +38,10 @@ struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_USE_URING);
 };
 
+struct LocalFileSnapshotEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_SNAPSHOT_LOCAL_PATH);
+};
+
 #undef MC_DEFINE_ENV_VAR
 
 }  // namespace mooncake
