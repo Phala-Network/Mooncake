@@ -1,7 +1,10 @@
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+
 add_subdirectory(cachelib_memory_allocator)
 add_subdirectory(local_ssd)
 
 set(MOONCAKE_STORE_SHARED_SOURCES
+    shared_cache_diagnostics.cpp
     types.cpp
     utils.cpp
     mmap_arena.cpp
@@ -629,3 +632,8 @@ if(WITH_STORE_C_SHARED)
     "$<$<CONFIG:Release>:-Wl,-s>")
   install(TARGETS mooncake_store_c DESTINATION lib)
 endif()
+
+# Shared diagnostics HMAC is used by client and master; runtime capture defaults off.
+target_link_libraries(mooncake_store_shared_objects PRIVATE OpenSSL::Crypto JsonCpp::JsonCpp)
+target_link_libraries(mooncake_store_master PRIVATE OpenSSL::Crypto)
+target_link_libraries(mooncake_store PUBLIC OpenSSL::Crypto)

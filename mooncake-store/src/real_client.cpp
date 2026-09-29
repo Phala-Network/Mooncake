@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "shared_cache_diagnostics.h"
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
@@ -63,6 +64,57 @@ DEFINE_int32(http_port, 9300,
 namespace mooncake {
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
+
+namespace scd = shared_cache_diagnostics;
+// Native batches are components, not user requests. Multiple disjoint pool
+// batches are accepted; repeated allowlisted keys make this epoch incomplete.
+class SharedCacheReadTrace {
+ public:
+    SharedCacheReadTrace(const std::vector<std::string>& keys,
+                         const std::string& tenant) noexcept
+        : keys_(keys), capture_(scd::Capture::Global()) {
+        enabled_ = capture_.Enabled() && capture_.BeginReadKeys(tenant,keys);
+        if (enabled_) {
+            try {
+                if (keys.size()>256) { capture_.Lost(); enabled_=false; return; }
+                tenant_=tenant;
+                events_.resize(keys.size());
+            } catch (...) { capture_.Lost(); enabled_=false; }
+        }
+    }
+    void Selected(size_t i, const Replica::Descriptor& r, uint64_t bytes) noexcept {
+        if (!enabled_) return;
+        try {
+            scd::Event event{scd::Kind::SelectedRead};
+            event.tier = r.is_memory_replica() ? scd::Tier::Memory :
+                         r.is_nof_replica() ? scd::Tier::NoF :
+                         r.is_local_disk_replica() ? scd::Tier::LocalDisk :
+                         r.is_dfs_replica() ? scd::Tier::Dfs : scd::Tier::Disk;
+            event.replica = r.id; event.requested_bytes = bytes;
+            if (r.is_local_disk_replica())
+                event.owner = r.get_local_disk_descriptor().transport_endpoint;
+            events_[i] = event;
+            capture_.Emit(tenant_, keys_[i], event);
+        } catch (...) { capture_.Lost(); enabled_ = false; }
+    }
+    template<class Results> void Finish(const Results& results) noexcept {
+        if (!enabled_) return;
+        for (size_t i=0; i<results.size(); ++i) {
+            auto& event=events_[i];
+            event.kind=scd::Kind::ReadReturn;
+            event.returned_bytes=results[i] ? results[i].value() : -1;
+            event.error=results[i] ? 0 : static_cast<int>(results[i].error());
+            capture_.Emit(tenant_, keys_[i], event);
+        }
+    }
+ private:
+    const std::vector<std::string>& keys_;
+    std::string tenant_;
+    scd::Capture& capture_;
+    bool enabled_=false;
+    std::vector<scd::Event> events_;
+};
+
 
 size_t DivideRoundUp(size_t value, size_t divisor) {
     return value / divisor + (value % divisor != 0);
@@ -5068,6 +5120,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         return results;
     }
 
+    SharedCacheReadTrace diagnostic(keys, client_->tenant_id());
+
     // Query metadata for all keys
     const auto query_results = client_->BatchQuery(keys);
 
@@ -5130,6 +5184,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         // Calculate required buffer size
         const auto replica = *best_replica;
         uint64_t total_size = calculate_total_size(replica);
+        diagnostic.Selected(i, replica, total_size);
 
         // Validate buffer capacity
         if (sizes[i] < total_size) {
@@ -5183,6 +5238,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     // Early return if no valid operations
     if (valid_operations.empty() && valid_local_disk_operations.empty() &&
         disk_operations.empty()) {
+        diagnostic.Finish(results);
         return results;
     }
 
@@ -5353,6 +5409,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     //           << "us, with memory key count: " << valid_operations.size()
     //           << ", offload key count: " << offload_object_count;
 
+    diagnostic.Finish(results);
     return results;
 }
 
@@ -6142,6 +6199,8 @@ RealClient::batch_get_into_multi_buffers_internal(
     if (num_keys == 0) {
         return results;
     }
+    SharedCacheReadTrace diagnostic(keys, client_->tenant_id());
+
     // Query metadata for all keys
     const auto query_results = client_->BatchQuery(keys);
     // Process each key individually and prepare for batch transfer
@@ -6200,6 +6259,7 @@ RealClient::batch_get_into_multi_buffers_internal(
         }
         const auto replica = *best_replica;
         uint64_t total_size = calculate_total_size(replica);
+        diagnostic.Selected(i, replica, total_size);
         const auto &sizes = all_sizes[i];
         uint64_t dst_total_size = 0;
         for (auto &size : sizes) {
@@ -6254,6 +6314,7 @@ RealClient::batch_get_into_multi_buffers_internal(
     }
     // Early return if no valid operations
     if (valid_operations.empty() && valid_local_disk_ops.empty()) {
+        diagnostic.Finish(results);
         return results;
     }
 
@@ -6455,6 +6516,7 @@ RealClient::batch_get_into_multi_buffers_internal(
         }
     }
 
+    diagnostic.Finish(results);
     return results;
 }
 

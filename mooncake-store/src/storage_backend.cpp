@@ -1,5 +1,7 @@
 #include "serializer.h"
 #include "storage_backend.h"
+#include "shared_cache_diagnostics.h"
+#include "tenant_id.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -33,6 +35,25 @@
 #include <ylt/util/tl/expected.hpp>
 
 namespace {
+// Called only after the actual backend read returns. Scoped storage keys are
+// decoded exactly once so the client/master use the identical tenant/key ID.
+void DiagnosticBackendRead(const std::string& scoped_key,
+                          mooncake::shared_cache_diagnostics::Backend backend,
+                          const std::string& file, uint64_t offset,
+                          uint64_t expected, int64_t actual, int error) noexcept {
+    namespace sd = mooncake::shared_cache_diagnostics;
+    auto& capture = sd::Capture::Global();
+    if (!capture.Enabled()) return;
+    try {
+        const auto identity = mooncake::TenantId::ParseScopedKey(scoped_key);
+        sd::Event event{sd::Kind::BackendRead};
+        event.tier=sd::Tier::LocalDisk; event.backend=backend;
+        event.physical_file=file; event.offset=offset;
+        event.requested_bytes=expected; event.returned_bytes=actual;
+        event.error=error;
+        capture.Emit(identity.first.value(),identity.second,event);
+    } catch (...) { capture.Lost(); }
+}
 struct FdGuard {
     int fd = -1;
     explicit FdGuard(int f) : fd(f) {}
@@ -1553,11 +1574,16 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
 
         auto r = storage_backend_->LoadObject(path, kv_buf, kv_buf.size());
         if (!r) {
+            DiagnosticBackendRead(key, shared_cache_diagnostics::Backend::FilePerKey,
+                                  path, 0, slice.size, -1, static_cast<int>(r.error()));
             LOG(ERROR) << "Failed to load from file";
             return tl::make_unexpected(r.error());
         }
 
         struct_pb::from_pb(kv, kv_buf);
+        DiagnosticBackendRead(key, shared_cache_diagnostics::Backend::FilePerKey,
+                              path, 0, slice.size, kv.value.size(),
+                              kv.value.size()==slice.size ? 0 : static_cast<int>(ErrorCode::FILE_READ_FAIL));
 
         if (!kv.value.empty()) {
             std::memcpy(slice.ptr, kv.value.data(), kv.value.size());
@@ -2025,6 +2051,22 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
 
             auto batch_read_result = uring_file->batch_read(
                 read_descs.data(), static_cast<int>(read_descs.size()));
+            // Report each true io_uring descriptor, including short/error
+            // results; aligned read bytes are reduced to the logical payload.
+            if (shared_cache_diagnostics::Capture::Global().Enabled()) {
+              for (size_t i=0; i<read_descs.size(); ++i) {
+                const auto& desc=read_descs[i];
+                const auto& bp=batch_read_plans[i];
+                const auto& plan=*bp.plan;
+                const int64_t actual=desc.bytes_read>bp.offset_in_buffer ?
+                    static_cast<int64_t>(std::min<size_t>(desc.bytes_read-bp.offset_in_buffer, plan.dest_slice.size)) : 0;
+                const bool full=desc.completed && desc.error==ErrorCode::OK && desc.bytes_read>=bp.min_required;
+                DiagnosticBackendRead(plan.key, shared_cache_diagnostics::Backend::Bucket,
+                                      filepath_res.value(), plan.offset+plan.key_size,
+                                      plan.dest_slice.size, actual,
+                                      full ? 0 : static_cast<int>(ErrorCode::FILE_READ_FAIL));
+              }
+            }
             if (!batch_read_result) {
                 for (size_t i = 0; i < read_descs.size(); ++i) {
                     if (read_descs[i].error == ErrorCode::OK) continue;
@@ -2069,6 +2111,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             int64_t actual_offset = plan.offset + plan.key_size;
             iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
             auto read_result = file->vector_read(&iov, 1, actual_offset);
+            DiagnosticBackendRead(plan.key, shared_cache_diagnostics::Backend::Bucket,
+                                  filepath_res.value(), actual_offset, plan.dest_slice.size,
+                                  read_result ? static_cast<int64_t>(read_result.value()) : -1,
+                                  read_result ? (read_result.value()==plan.dest_slice.size ? 0 : static_cast<int>(ErrorCode::FILE_READ_FAIL)) : static_cast<int>(read_result.error()));
             if (!read_result) {
                 LOG(ERROR) << "vector_read failed for key: " << plan.key
                            << ", bucket_id=" << plan.bucket_id
@@ -5366,6 +5412,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         // the data_file_ member) cannot destroy this file while we still have
         // pending I/O on it in phase 2 (no shard lock held there).
         std::shared_ptr<StorageFile> data_file;
+        std::string diagnostic_file;
     };
 
     std::vector<ReadPlan> read_plans;
@@ -5400,7 +5447,8 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         read_plans.push_back(
             ReadPlan{key, entry.offset, entry.value_size,
                      entry.allocation,  // shared_ptr copy, increments refcount
-                     dest_slice, data_file_});
+                     dest_slice, data_file_,
+                     shared_cache_diagnostics::Capture::Global().Enabled() ? data_file_path_ : std::string{}});
 
         // Lock released here; allocation + data_file stay alive via shared_ptr
     }
@@ -5463,6 +5511,11 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         auto read_value_result = plan.data_file->vector_read(
             &value_iov, 1,
             plan.offset + RecordHeader::ValueOffsetInRecord(header.key_len));
+        DiagnosticBackendRead(plan.key, shared_cache_diagnostics::Backend::OffsetAllocator,
+                              plan.diagnostic_file, plan.offset+RecordHeader::ValueOffsetInRecord(header.key_len),
+                              plan.dest_slice.size,
+                              read_value_result ? static_cast<int64_t>(read_value_result.value()) : -1,
+                              read_value_result ? (read_value_result.value()==header.value_len ? 0 : static_cast<int>(ErrorCode::FILE_READ_FAIL)) : static_cast<int>(read_value_result.error()));
         if (!read_value_result) {
             LOG(ERROR) << "Failed to read value for key: " << plan.key
                        << ", error: " << read_value_result.error();

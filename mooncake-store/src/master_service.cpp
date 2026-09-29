@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "shared_cache_diagnostics.h"
 
 #include <algorithm>
 #include <array>
@@ -8863,6 +8864,7 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    const ReplicaID diagnostic_replica_id = task_it->second.alloc_id;
     bool committed = false;
     Replica* staged = metadata.GetReplicaByID(task_it->second.alloc_id);
     if (staged != nullptr && staged->is_memory_replica() &&
@@ -8952,6 +8954,13 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     if (!committed) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
+    if (shared_cache_diagnostics::Capture::Global().Enabled()) {
+        shared_cache_diagnostics::Event event{shared_cache_diagnostics::Kind::PromotionCommit};
+        event.tier=shared_cache_diagnostics::Tier::Memory;
+        event.replica=diagnostic_replica_id; event.requested_bytes=completed_bytes;
+        event.returned_bytes=completed_bytes; event.committed=true;
+        shared_cache_diagnostics::Capture::Global().Emit(object_id.tenant_id.value(), object_id.user_key, event);
+    }
     return {};
 }
 
@@ -8982,6 +8991,7 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    const ReplicaID diagnostic_replica_id = task_it->second.alloc_id;
     // Mirror the reaper's expiry path; see DiscardExpiredProcessingReplicas
     // Part 4 for the full rationale on each step.
     auto* source = metadata.GetReplicaByID(task_it->second.source_id);
@@ -9047,6 +9057,12 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     local_ssd_manager_.RemovePromotion(client_id, object_id.tenant_id,
                                        object_id.user_key);
 
+    if (shared_cache_diagnostics::Capture::Global().Enabled()) {
+        shared_cache_diagnostics::Event event{shared_cache_diagnostics::Kind::PromotionFailure};
+        event.tier=shared_cache_diagnostics::Tier::Memory;
+        event.replica=diagnostic_replica_id; event.error=static_cast<int>(ErrorCode::REPLICA_IS_NOT_READY);
+        shared_cache_diagnostics::Capture::Global().Emit(object_id.tenant_id.value(), object_id.user_key, event);
+    }
     return {};
 }
 
