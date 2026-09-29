@@ -144,6 +144,83 @@ Capture::Capture() = default;
 Capture::Capture(Config c) : impl_(std::make_unique<Impl>(std::move(c))) {}
 Capture::~Capture() = default;
 bool Capture::Enabled() const noexcept { return impl_ && !impl_->expired.load(); }
+bool Capture::OwnerEnabled() const noexcept {
+    return Enabled() && impl_->config.capture_owner_drain;
+}
+void Capture::EmitOwner(const OwnerDrainSnapshot& owner) noexcept {
+    if (!OwnerEnabled()) return;
+    try {
+        std::lock_guard<std::mutex> guard(impl_->mutex);
+        auto& s = *impl_;
+        if (Clock::now() >= s.deadline) {
+            s.expired = true;
+            ++s.dropped;
+            return;
+        }
+        if (++s.attempts > s.config.max_events * 4 ||
+            s.emitted >= s.config.max_events ||
+            s.queue.size() >= s.config.queue_capacity) {
+            ++s.dropped;
+            return;
+        }
+        Json::Value v;
+        v["schema"] = "phala.shared-cache.owner-drain.v1";
+        v["kind"] = "owner_drain";
+        v["case_id"] = s.config.case_id;
+        v["epoch"] = s.config.epoch;
+        v["tenant_id"] = s.config.tenant_id;
+        v["pid"] = Json::Int64(getpid());
+        const auto id = [&](const char* domain, const std::string& raw) {
+            return Identifier(s.config, domain, s.config.tenant_id, raw);
+        };
+        v["owner_id"] = id("phala.shared-cache-owner.v1", owner.owner);
+        v["store_instance_id"] =
+            id("phala.shared-cache-owner.v1", owner.instance);
+        v["scope_id"] = id("phala.shared-cache-owner.v1", owner.scope);
+        v["backend_path_id"] = id("phala.shared-cache-file.v1", owner.path);
+        v["owner_client_requested_tenant_id"] = owner.client_tenant;
+        v["coverage"] = "owner_global_bucket";
+        v["sample_time_unix_ms"] = Json::UInt64(owner.sample_time_unix_ms);
+        v["init_completed_unix_ms"] =
+            Json::UInt64(owner.init_completed_unix_ms);
+        v["scan_completed_unix_ms"] =
+            Json::UInt64(owner.scan_completed_unix_ms);
+        v["owner_sample_sequence"] = Json::UInt64(owner.sample_sequence);
+        v["activity_sequence"] = Json::UInt64(owner.activity_sequence);
+        const char* names[] = {
+            "loads",      "offloads", "promotions",         "removes",
+            "heartbeats", "rescans",  "leased_read_buffers"};
+        for (size_t i = 0; i < owner.active.size(); ++i)
+            v["active"][names[i]] = Json::UInt64(owner.active[i]);
+        v["pending"]["backend_writes"] = Json::UInt64(owner.pending_writes);
+        v["pending"]["backend_evictions"] =
+            Json::UInt64(owner.pending_evictions);
+        v["pending"]["ungrouped_offloads"] =
+            Json::UInt64(owner.pending_ungrouped);
+        v["pending"]["read_guards"] = Json::UInt64(owner.read_guards);
+        v["bucket_count"] = Json::UInt64(owner.bucket_count);
+        v["covered_buckets"] = Json::UInt64(owner.covered_buckets);
+        v["available"] = owner.available;
+        v["consistent"] = owner.consistent;
+        v["backend_initialized"] = owner.backend_initialized;
+        v["bucket_eviction_policy"] = owner.eviction_policy;
+        v["disk_watermark_eviction"] = owner.watermark_eviction;
+        v["metadata_resync_pending"] = owner.resync_pending;
+        v["draining"] = owner.draining;
+        v["heartbeat_ok"] = owner.heartbeat_ok;
+        const auto line = EncodeJson(v);
+        if (line.size() > 4096 ||
+            s.bytes + line.size() + kSummaryReserve > s.config.max_bytes) {
+            ++s.dropped;
+            return;
+        }
+        s.queue.push_back(line);
+        s.bytes += line.size();
+        ++s.emitted;
+    } catch (...) {
+        Lost();
+    }
+}
 bool Capture::BeginReadKeys(const std::string& tenant, const std::vector<std::string>& keys) noexcept {
     if (!Enabled()) return false;
     try {
@@ -272,6 +349,11 @@ Capture& Capture::Global() noexcept {
                 if (!parser->parse(data.data(), data.data() + data.size(), &v, &errors))
                     throw std::runtime_error("invalid diagnostic manifest JSON");
                 Config c;
+                if (v.isMember("capture_owner_drain") &&
+                    !v["capture_owner_drain"].isBool())
+                    throw std::runtime_error("invalid diagnostic owner mode");
+                c.capture_owner_drain =
+                    v.get("capture_owner_drain", false).asBool();
                 c.case_id=v["case_id"].asString(); c.epoch=v["epoch"].asString();
                 c.tenant_id=v["tenant_id"].asString(); c.key_salt=v["key_salt"].asString();
                 c.rank=v["rank"].asString(); c.component=v["component"].asString();

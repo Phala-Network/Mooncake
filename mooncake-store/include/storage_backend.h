@@ -387,6 +387,14 @@ struct FileStorageConfig {
 
 class StorageBackendInterface {
    public:
+    struct DrainSnapshot {
+        uint64_t pending_writes = 0, pending_evictions = 0,
+                 pending_ungrouped = 0;
+        uint64_t read_guards = 0, bucket_count = 0, covered_buckets = 0;
+        bool available = false, initialized = false;
+        std::string eviction_policy = "unknown";
+    };
+    virtual DrainSnapshot GetDrainSnapshot() const { return {}; }
     explicit StorageBackendInterface(const FileStorageConfig& config)
         : file_storage_config_(config) {}
     virtual ~StorageBackendInterface() = default;
@@ -1173,6 +1181,7 @@ class BucketStorageBackend : public StorageBackendInterface {
         SharedMutexLocker lock(&mutex_, shared_lock);
         return lru_index_.size();
     }
+    DrainSnapshot GetDrainSnapshot() const override;
 
    private:
     // Alignment helper functions for O_DIRECT I/O

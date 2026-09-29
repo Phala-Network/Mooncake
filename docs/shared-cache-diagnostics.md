@@ -219,3 +219,13 @@ but real automatic backend eviction must be disabled with evidence or honor
 the finite hold. Source implementation of that hold and an authenticated
 original-writer command remain a separate decision; no unsafe shortcut or
 new public deletion API is included here.
+
+## Optional owner drain observation
+
+Set `capture_owner_drain=true` in the existing sealed diagnostics manifest to emit `kind=owner_drain`, `schema=phala.shared-cache.owner-drain.v1` records into the same bounded private JSONL. This is a process-local FileStorage observer; the master metadata endpoint still cannot report backend drain. Unavailable backends report unavailable and never synthesize a quiet state.
+
+Each record has actual bucket metadata counts and FileStorage activity counts for loads, offloads, promotions, removes, heartbeats, rescans and leased read buffers. Buffer ownership remains active until its actual remote/local lease is destroyed. Bucket writes, evictions, ungrouped offloads and read guards are sampled under their existing locks, with a finite256bucket limit. An owner activity revision brackets that sample; raced snapshots are marked inconsistent. Init/Scan timestamps are recorded only after actual successful completion, and heartbeat success, resync/draining flags, bucket eviction policy and watermark setting describe actual state.
+
+`owner_id`, runtime-generated `store_instance_id`, `scope_id` and `backend_path_id` use existing case/epoch/tenant HMAC framing. The configured tenant is only capture correlation; `owner_client_requested_tenant_id` records the client request tenant separately. Establish the owner mapping from independent process/container/backend identity and master replica metadata, then require the same instance across the scene. The mapping is not a new storage generation or ownership protocol.
+
+The consumer requires an available, consistent, initialized owner with full bucket coverage, successful heartbeat, completed Init/Scan, selected static-retention settings, no resync/draining and all active/pending values zero over its existing quiet window. `owner_sample_sequence` orders snapshots; `activity_sequence` changes for actual work and buffer lifetime, excluding idle heartbeats. Concurrent JSONL output may be reordered. Final `capture_summary` must be present and complete with zero drops; damaged/missing/truncated evidence cannot establish drain. This observer supplies evidence and does not hold the storage lifecycle or guarantee future quiescence.

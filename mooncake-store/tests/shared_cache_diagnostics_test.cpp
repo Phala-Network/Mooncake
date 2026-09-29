@@ -82,6 +82,37 @@ int main(int argc, char** argv) {
     assert(Identifier(config,"phala.shared-cache-key.v1","other","component-key")!=config.key_ids[0]);
     assert(Identifier(config,"phala.shared-cache-key.v1","default","component-key-more")!=config.key_ids[0]);
 
+    auto owner_config = config;
+    owner_config.capture_owner_drain = true;
+    Capture owner_capture(owner_config);
+    OwnerDrainSnapshot owner;
+    owner.owner = "private-owner-uuid";
+    owner.instance = "private-instance-uuid";
+    owner.scope = "private-owner-endpoint";
+    owner.path = "/private/backend/path";
+    owner.client_tenant = "default";
+    owner.available = true;
+    owner.consistent = true;
+    owner.backend_initialized = true;
+    owner.bucket_count = owner.covered_buckets = 2;
+    owner.active[0] = 1;
+    owner.active[6] = 1;
+    owner_capture.EmitOwner(owner);
+    auto owner_output = owner_capture.Drain();
+    assert(owner_output.complete && owner_output.events.size() == 1);
+    const auto& owner_line = owner_output.events[0];
+    for (const auto& secret :
+         {owner.owner, owner.instance, owner.scope, owner.path})
+        assert(owner_line.find(secret) == std::string::npos);
+    assert(owner_line.find("phala.shared-cache.owner-drain.v1") !=
+           std::string::npos);
+    assert(owner_line.find("\"loads\":1") != std::string::npos);
+    assert(owner_line.find("\"leased_read_buffers\":1") != std::string::npos);
+    assert(owner_line.size() <= 4096);
+    Capture owner_disabled(config);
+    owner_disabled.EmitOwner(owner);
+    assert(owner_disabled.Drain().events.empty());
+
     Capture disabled;
     assert(!disabled.Enabled() && !disabled.BeginReadKeys("default",{"component-key"}));
     Event event{Kind::BackendRead}; event.tier=Tier::LocalDisk;

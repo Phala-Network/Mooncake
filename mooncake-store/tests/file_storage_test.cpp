@@ -2,6 +2,8 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <condition_variable>
+#include <future>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -27,6 +29,11 @@ void UnsetEnv(const std::string& key) { unsetenv(key.c_str()); }
 class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
+    void SetBackend(FileStorage& storage,
+                    std::shared_ptr<StorageBackendInterface> backend) {
+        storage.storage_backend_ = std::move(backend);
+    }
+
     void SetUp() override {
         google::InitGoogleLogging("FileStorageTest");
         FLAGS_logtostderr = true;
@@ -870,4 +877,104 @@ TEST_F(FileStorageTest, NullSsdMetricDoesNotCrash) {
     // No crash = success. No metrics pointer, so nothing to verify.
 }
 
+}  // namespace mooncake
+
+namespace mooncake {
+class SlowDrainBucketBackend : public BucketStorageBackend {
+   public:
+    using BucketStorageBackend::BucketStorageBackend;
+    std::mutex gate;
+    std::condition_variable cv;
+    bool entered = false, released = false;
+    tl::expected<void, ErrorCode> BatchLoad(
+        std::unordered_map<std::string, Slice>& slices) override {
+        {
+            std::unique_lock<std::mutex> lock(gate);
+            entered = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return released; });
+        }
+        return BucketStorageBackend::BatchLoad(slices);
+    }
+};
+TEST_F(FileStorageTest, OwnerDrainTracksActualBlockedLoadAndLeasedBuffer) {
+    SetEnv("MOONCAKE_SHARED_CACHE_DIAGNOSTICS_MANIFEST",
+           data_path + "/absent-sealed-manifest.json");
+    struct ResetEnv {
+        ~ResetEnv() { UnsetEnv("MOONCAKE_SHARED_CACHE_DIAGNOSTICS_MANIFEST"); }
+    } reset;
+    fs::create_directories(data_path + "/owner-master");
+    testing::InProcMaster master;
+    auto master_config = InProcMasterConfigBuilder()
+                             .set_enable_offload(true)
+                             .set_root_fs_dir(data_path + "/owner-master")
+                             .build();
+    ASSERT_TRUE(master.Start(master_config));
+    const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client.has_value());
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kBucket;
+    config.storage_filepath = data_path + "/owner-buckets";
+    config.local_buffer_size = 4 * 1024 * 1024;
+    config.heartbeat_interval_seconds = 1;
+    config.client_buffer_gc_interval_seconds = 1;
+    config.enable_disk_watermark_eviction = false;
+    fs::create_directories(config.storage_filepath);
+    auto bucket_config = BucketBackendConfig::FromEnvironment();
+    bucket_config.eviction_policy = BucketEvictionPolicy::NONE;
+    auto backend =
+        std::make_shared<SlowDrainBucketBackend>(config, bucket_config);
+    FileStorage storage(config, client.value(), endpoint);
+    SetBackend(storage, backend);
+    ASSERT_TRUE(storage.Init());
+    auto initial = storage.GetOwnerDrainSnapshot();
+    EXPECT_TRUE(initial.available);
+    EXPECT_TRUE(initial.backend_initialized);
+    EXPECT_GT(initial.init_completed_unix_ms, 0);
+    EXPECT_GT(initial.scan_completed_unix_ms, 0);
+    std::string payload(512, 'q');
+    std::unordered_map<std::string, std::vector<Slice>> values{
+        {"owner-key", {{payload.data(), payload.size()}}}};
+    ASSERT_TRUE(backend->BatchOffload(
+        values, [](const auto&, auto&) { return ErrorCode::OK; }));
+    auto load = std::async(std::launch::async, [&] {
+        return storage.BatchGet({"owner-key"}, {512});
+    });
+    bool entered;
+    {
+        std::unique_lock<std::mutex> lock(backend->gate);
+        entered = backend->cv.wait_for(lock, std::chrono::seconds(5),
+                                       [&] { return backend->entered; });
+    }
+    auto blocked = storage.GetOwnerDrainSnapshot();
+    EXPECT_TRUE(entered);
+    EXPECT_GT(blocked.active[0], 0);
+    EXPECT_GT(blocked.active[6], 0);
+    EXPECT_EQ(blocked.bucket_count, blocked.covered_buckets);
+    EXPECT_GT(blocked.bucket_count, 0);
+    {
+        std::lock_guard<std::mutex> lock(backend->gate);
+        backend->released = true;
+    }
+    backend->cv.notify_all();
+    auto result = load.get();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(std::memcmp(reinterpret_cast<void*>(result->pointers[0]),
+                          payload.data(), 512),
+              0);
+    auto leased = storage.GetOwnerDrainSnapshot();
+    EXPECT_EQ(leased.active[0], 0);
+    EXPECT_EQ(leased.active[6], 1);
+    EXPECT_TRUE(storage.ReleaseBuffer(result->batch_id));
+    auto drained = storage.GetOwnerDrainSnapshot();
+    EXPECT_EQ(drained.active[0], 0);
+    EXPECT_EQ(drained.active[6], 0);
+    EXPECT_EQ(drained.pending_writes, 0);
+    EXPECT_EQ(drained.pending_evictions, 0);
+    EXPECT_EQ(drained.read_guards, 0);
+    EXPECT_EQ(drained.instance, initial.instance);
+    EXPECT_GT(drained.activity_sequence, blocked.activity_sequence);
+}
 }  // namespace mooncake

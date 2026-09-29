@@ -2492,6 +2492,32 @@ size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
     return ungrouped_offloading_objects_.size();
 }
 
+StorageBackendInterface::DrainSnapshot BucketStorageBackend::GetDrainSnapshot()
+    const {
+    DrainSnapshot result;
+    {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        result.initialized = initialized_.load();
+        result.pending_writes = pending_write_keys_.size();
+        result.pending_evictions = pending_eviction_keys_.size();
+        result.bucket_count = buckets_.size();
+        std::ostringstream policy;
+        policy << bucket_backend_config_.eviction_policy;
+        result.eviction_policy = policy.str();
+        // Finite experiment only; never scan an unbounded production store.
+        if (buckets_.size() > 256) return result;
+        for (const auto& [id, bucket] : buckets_) {
+            (void)id;
+            result.read_guards +=
+                bucket->inflight_reads_.load(std::memory_order_acquire);
+            ++result.covered_buckets;
+        }
+    }
+    result.pending_ungrouped = UngroupedOffloadingObjectsSize();
+    result.available = true;
+    return result;
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
     std::vector<std::vector<std::string>>& buckets_keys) {

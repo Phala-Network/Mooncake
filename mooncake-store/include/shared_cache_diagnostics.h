@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <chrono>
 #include <optional>
 #include <utility>
@@ -31,10 +32,28 @@ class ReadPurposeScope {
 };
 
 struct Config {
+    bool capture_owner_drain = false;
     std::string case_id, epoch, tenant_id, key_salt, rank, component;
     std::vector<std::string> key_ids;
     uint64_t max_keys = 64, max_events = 1024, max_bytes = 1048576;
     uint64_t max_duration_ms = 30000, max_requests = 1, queue_capacity = 256;
+};
+
+// Process-local owner observations, not a retention lock or storage generation.
+struct OwnerDrainSnapshot {
+    std::string owner, instance, scope, path, client_tenant;
+    uint64_t sample_time_unix_ms = 0, init_completed_unix_ms = 0;
+    uint64_t scan_completed_unix_ms = 0, sample_sequence = 0,
+             activity_sequence = 0;
+    // load, offload, promotion, remove/eviction, heartbeat, rescan, leased
+    // buffer
+    std::array<uint64_t, 7> active{};
+    uint64_t pending_writes = 0, pending_evictions = 0, pending_ungrouped = 0;
+    uint64_t read_guards = 0, bucket_count = 0, covered_buckets = 0;
+    bool available = false, consistent = false, backend_initialized = false;
+    bool watermark_eviction = true, resync_pending = false, draining = false;
+    bool heartbeat_ok = false;
+    std::string eviction_policy = "unknown";
 };
 
 // HMAC input is domain + NUL, then uint32 big-endian length-prefixed UTF-8
@@ -87,6 +106,8 @@ class Capture {
     Capture(const Capture&) = delete;
     Capture& operator=(const Capture&) = delete;
     bool Enabled() const noexcept;
+    bool OwnerEnabled() const noexcept;
+    void EmitOwner(const OwnerDrainSnapshot&) noexcept;
     bool BeginReadKeys(const std::string& tenant, const std::vector<std::string>& keys) noexcept;
     void Lost() noexcept;
     void Emit(const std::string& tenant, const std::string& key,

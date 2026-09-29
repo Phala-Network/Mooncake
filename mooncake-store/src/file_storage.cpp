@@ -39,6 +39,118 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
 
 }  // namespace
 
+struct FileStorage::OwnerState {
+    std::mutex mutex;
+    std::array<uint64_t, 7> active{};
+    uint64_t revision = 0, activity_sequence = 0, sample_sequence = 0;
+    uint64_t init_ms = 0, scan_ms = 0;
+    bool heartbeat_ok = false;
+    std::atomic<bool> failed{false};
+    std::string instance = UuidToString(generate_uuid());
+};
+struct FileStorage::OwnerLease {
+    std::shared_ptr<OwnerState> state;
+    size_t index;
+    explicit OwnerLease(std::shared_ptr<OwnerState> value, size_t operation)
+        : state(std::move(value)), index(operation) {
+        if (!state) return;
+        try {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            ++state->active[index];
+            ++state->revision;
+            if (index != 4) ++state->activity_sequence;
+        } catch (...) {
+            state->failed = true;
+            state.reset();
+        }
+    }
+    void Release() noexcept {
+        if (!state) return;
+        try {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            --state->active[index];
+            ++state->revision;
+            if (index != 4) ++state->activity_sequence;
+        } catch (...) {
+            state->failed = true;
+        }
+        state.reset();
+    }
+    ~OwnerLease() { Release(); }
+};
+class FileStorage::OwnerScope {
+    FileStorage& owner;
+    OwnerLease lease;
+
+   public:
+    OwnerScope(FileStorage& value, size_t operation)
+        : owner(value), lease(value.owner_state_, operation) {
+        owner.EmitOwnerDrain();
+    }
+    ~OwnerScope() {
+        lease.Release();
+        owner.EmitOwnerDrain();
+    }
+};
+
+namespace {
+uint64_t OwnerNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+}  // namespace
+shared_cache_diagnostics::OwnerDrainSnapshot
+FileStorage::GetOwnerDrainSnapshot() const {
+    shared_cache_diagnostics::OwnerDrainSnapshot result;
+    if (!owner_state_) return result;
+    uint64_t revision;
+    {
+        std::lock_guard<std::mutex> lock(owner_state_->mutex);
+        revision = owner_state_->revision;
+        result.active = owner_state_->active;
+        result.activity_sequence = owner_state_->activity_sequence;
+        result.sample_sequence = ++owner_state_->sample_sequence;
+        result.init_completed_unix_ms = owner_state_->init_ms;
+        result.scan_completed_unix_ms = owner_state_->scan_ms;
+        result.heartbeat_ok = owner_state_->heartbeat_ok;
+        result.instance = owner_state_->instance;
+    }
+    result.sample_time_unix_ms = OwnerNowMs();
+    result.owner = client_ ? UuidToString(client_->getClientId()) : "";
+    result.client_tenant = client_ ? client_->tenant_id() : "";
+    result.scope = local_rpc_addr_;
+    result.path = config_.storage_filepath;
+    result.watermark_eviction = config_.enable_disk_watermark_eviction;
+    result.resync_pending = metadata_resync_pending_.load();
+    result.draining = draining_.load();
+    const auto backend = storage_backend_->GetDrainSnapshot();
+    result.pending_writes = backend.pending_writes;
+    result.pending_evictions = backend.pending_evictions;
+    result.pending_ungrouped = backend.pending_ungrouped;
+    result.read_guards = backend.read_guards;
+    result.bucket_count = backend.bucket_count;
+    result.covered_buckets = backend.covered_buckets;
+    result.eviction_policy = backend.eviction_policy;
+    result.backend_initialized = backend.initialized;
+    result.available =
+        backend.available && client_ != nullptr && !owner_state_->failed.load();
+    {
+        std::lock_guard<std::mutex> lock(owner_state_->mutex);
+        result.consistent = revision == owner_state_->revision;
+    }
+    return result;
+}
+void FileStorage::EmitOwnerDrain() const noexcept {
+    if (!owner_state_) return;
+    try {
+        auto& capture = shared_cache_diagnostics::Capture::Global();
+        if (capture.OwnerEnabled()) capture.EmitOwner(GetOwnerDrainSnapshot());
+    } catch (...) {
+        shared_cache_diagnostics::Capture::Global().Lost();
+    }
+}
+
 FileStorage::FileStorage(const FileStorageConfig& config,
                          std::shared_ptr<Client> client,
                          const std::string& local_rpc_addr,
@@ -50,6 +162,13 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
           config.local_buffer_size, client ? client->GetProtocol() : "")) {
+    try {
+        if (const char* manifest =
+                std::getenv("MOONCAKE_SHARED_CACHE_DIAGNOSTICS_MANIFEST");
+            manifest && *manifest)
+            owner_state_ = std::make_shared<OwnerState>();
+    } catch (...) {
+    }
     if (config_.storage_backend_type == StorageBackendType::kDistributed) {
         config_.enable_dfs = true;
     }
@@ -130,6 +249,7 @@ FileStorage::~FileStorage() {
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {
+    OwnerScope observation(*this, 5);
     auto register_memory_result = RegisterLocalMemory();
     if (!register_memory_result) {
         LOG(ERROR) << "Failed to register local memory: "
@@ -213,6 +333,15 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         }
     }
 
+    if (owner_state_ && scan_meta_result) {
+        try {
+            std::lock_guard<std::mutex> lock(owner_state_->mutex);
+            owner_state_->scan_ms = OwnerNowMs();
+            ++owner_state_->revision;
+        } catch (...) {
+            owner_state_->failed = true;
+        }
+    }
     heartbeat_running_.store(true);
     heartbeat_thread_ = std::thread([this]() {
         LOG(INFO) << "Starting periodic task with interval: "
@@ -227,6 +356,15 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     client_buffer_gc_running_.store(true);
     client_buffer_gc_thread_ =
         std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
+    if (owner_state_) {
+        try {
+            std::lock_guard<std::mutex> lock(owner_state_->mutex);
+            owner_state_->init_ms = OwnerNowMs();
+            ++owner_state_->revision;
+        } catch (...) {
+            owner_state_->failed = true;
+        }
+    }
     return {};
 }
 
@@ -316,6 +454,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     if (offloading_objects.empty()) {
         return {};
     }
+    OwnerScope observation(*this, 1);
     std::unordered_map<std::string, int64_t> storage_object_sizes;
     std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key;
     storage_object_sizes.reserve(offloading_objects.size());
@@ -622,6 +761,7 @@ tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
         return {};
     }
 
+    OwnerScope observation(*this, 3);
     auto eviction_result = storage_backend_->EvictAboveDiskWatermark(
         config_.disk_eviction_high_watermark_ratio,
         config_.disk_eviction_low_watermark_ratio,
@@ -652,6 +792,24 @@ tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
 }
 
 tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
+    auto result = [&] {
+        OwnerLease lease(owner_state_, 4);
+        return HeartbeatImpl();
+    }();
+    if (owner_state_) {
+        try {
+            std::lock_guard<std::mutex> lock(owner_state_->mutex);
+            owner_state_->heartbeat_ok = result.has_value();
+            ++owner_state_->revision;
+        } catch (...) {
+            owner_state_->failed = true;
+        }
+    }
+    EmitOwnerDrain();
+    return result;
+}
+
+tl::expected<void, ErrorCode> FileStorage::HeartbeatImpl() {
     if (client_ == nullptr) {
         LOG(ERROR) << "client is nullptr";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -804,6 +962,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
 }
 
 void FileStorage::RemoveAll() {
+    OwnerScope observation(*this, 3);
     // TODO(tenant-isolation): This performs a tenant-UNAWARE global wipe of the
     // storage directory. Storage backends store physical files without a
     // tenant dimension, so a tenant-scoped master RemoveAll("tenant_A") that
@@ -880,6 +1039,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         return {};
     }
 
+    OwnerScope observation(*this, 2);
     VLOG(1) << "ProcessPromotionTasks pulled " << promotion_objects.size()
             << " promotion candidate(s) from master";
 
@@ -1014,6 +1174,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
 tl::expected<void, ErrorCode> FileStorage::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {
     auto start_time = std::chrono::steady_clock::now();
+    OwnerScope observation(*this, 0);
     auto result = storage_backend_->BatchLoad(batch_object);
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1095,6 +1256,14 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto result = std::make_shared<AllocatedBatch>();
+    if (owner_state_) {
+        try {
+            result->diagnostic_owner_lease =
+                std::make_shared<OwnerLease>(owner_state_, 6);
+        } catch (...) {
+            owner_state_->failed = true;
+        }
+    }
     result->batch_id = next_batch_id_.fetch_add(1, std::memory_order_relaxed);
     std::chrono::steady_clock::time_point now =
         std::chrono::steady_clock::now();
@@ -1202,6 +1371,7 @@ bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
 }
 
 tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
+    OwnerScope observation(*this, 5);
     LOG(INFO) << "ReRegisterOffloadedObjects: starting ScanMeta to re-register "
               << "offloaded objects with master";
     int total_keys = 0;
@@ -1265,6 +1435,15 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
         LOG(ERROR) << "ReRegisterOffloadedObjects: ScanMeta failed: "
                    << scan_meta_result.error();
         return scan_meta_result;
+    }
+    if (owner_state_) {
+        try {
+            std::lock_guard<std::mutex> lock(owner_state_->mutex);
+            owner_state_->scan_ms = OwnerNowMs();
+            ++owner_state_->revision;
+        } catch (...) {
+            owner_state_->failed = true;
+        }
     }
     LOG(INFO) << "ReRegisterOffloadedObjects: completed. "
               << "total_keys=" << total_keys
