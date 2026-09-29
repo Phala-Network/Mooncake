@@ -280,6 +280,11 @@ device::NcclTransport* TransferEngine::getOrCreateNcclTransport() {
 }
 #endif
 
+Status TransferEngine::getBatchTransportSelection(
+    BatchID batch_id, Transport::BatchTransportSelection& selection) {
+    return impl_->getBatchTransportSelection(batch_id, selection);
+}
+
 bool TransferEngine::isTcpOnly() const { return impl_->isTcpOnly(); }
 
 int TransferEngine::syncSegmentCache(const std::string& segment_name) {
@@ -823,6 +828,15 @@ device::NcclTransport* TransferEngine::getOrCreateNcclTransport() {
     return impl_->getOrCreateNcclTransport();
 }
 #endif
+
+Status TransferEngine::getBatchTransportSelection(
+    BatchID batch_id, Transport::BatchTransportSelection& selection) {
+    if (use_tent_) {
+        selection = {};
+        return Status::NotImplemented("Classic batch transport selection only");
+    }
+    return impl_->getBatchTransportSelection(batch_id, selection);
+}
 
 bool TransferEngine::isTcpOnly() const {
     if (use_tent_)

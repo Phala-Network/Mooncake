@@ -460,6 +460,38 @@ int TransferEnginePy::batchTransferSyncRead(
                              transport_hint);
 }
 
+pybind11::dict TransferEnginePy::batchTransferSyncWriteDiagnostic(
+    const char* target_hostname, std::vector<uintptr_t> buffers,
+    std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
+    const std::string& transport_hint) {
+    static std::atomic<uint64_t> sequence{0};
+    const auto batch_sequence = sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::vector<BatchAttemptDiagnostic> diagnostics;
+    bool truncated = false;
+    const int result = batchTransferSyncImpl(
+        target_hostname, std::move(buffers), std::move(peer_buffer_addresses),
+        std::move(lengths), TransferOpcode::WRITE, nullptr, transport_hint,
+        &diagnostics, &truncated);
+    pybind11::dict record;
+    record["result"] = result;
+    record["batch_sequence"] = batch_sequence;
+    record["diagnostics_truncated"] = truncated;
+    pybind11::list attempts;
+    for (size_t i = 0; i < diagnostics.size(); ++i) {
+        const auto& native = diagnostics[i];
+        pybind11::dict attempt;
+        attempt["attempt"] = i;
+        attempt["task_count"] = native.selection.task_count;
+        attempt["missing_transports"] = native.selection.missing_transports;
+        attempt["selected_transports"] = native.selection.selected_transports;
+        attempt["terminal_status"] = native.terminal_status;
+        attempt["transferred_bytes"] = native.transferred_bytes;
+        attempts.append(attempt);
+    }
+    record["attempts"] = attempts;
+    return record;
+}
+
 batch_id_t TransferEnginePy::batchTransferAsyncWrite(
     const char* target_hostname, const std::vector<uintptr_t>& buffers,
     const std::vector<uintptr_t>& peer_buffer_addresses,
@@ -576,6 +608,18 @@ int TransferEnginePy::batchTransferSync(
     std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
     TransferOpcode opcode, TransferNotify* notify,
     const std::string& transport_hint) {
+    return batchTransferSyncImpl(
+        target_hostname, std::move(buffers), std::move(peer_buffer_addresses),
+        std::move(lengths), opcode, notify, transport_hint);
+}
+
+int TransferEnginePy::batchTransferSyncImpl(
+    const char* target_hostname, std::vector<uintptr_t> buffers,
+    std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
+    TransferOpcode opcode, TransferNotify* notify,
+    const std::string& transport_hint,
+    std::vector<BatchAttemptDiagnostic>* diagnostics,
+    bool* diagnostics_truncated) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
@@ -619,12 +663,26 @@ int TransferEnginePy::batchTransferSync(
 
     for (int retry = 0; retry < max_retry; ++retry) {
         auto batch_id = engine_->allocateBatchID(batch_size);
+        BatchAttemptDiagnostic* diagnostic = nullptr;
+        if (diagnostics) {
+            if (diagnostics->size() < 64) {
+                diagnostic = &diagnostics->emplace_back();
+            } else {
+                *diagnostics_truncated = true;
+            }
+        }
         Status s =
             notify
                 ? engine_->submitTransferWithNotify(
                       batch_id, entries,
                       TransferMetadata::NotifyDesc{notify->name, notify->msg})
                 : engine_->submitTransfer(batch_id, entries);
+        if (diagnostic) {
+            auto selected = engine_->getBatchTransportSelection(
+                batch_id, diagnostic->selection);
+            if (!selected.ok()) diagnostic->selection.missing_transports = batch_size;
+            diagnostic->terminal_status = s.ok() ? "waiting" : "submit_failed";
+        }
         if (!s.ok()) {
             engine_->freeBatchID(batch_id);
             Status segment_status = engine_->CheckSegmentStatus(handle);
@@ -646,14 +704,18 @@ int TransferEnginePy::batchTransferSync(
         while (!completed) {
             Status s = engine_->getBatchTransferStatus(batch_id, status);
             LOG_ASSERT(s.ok());
+            if (diagnostic) diagnostic->transferred_bytes = status.transferred_bytes;
             if (status.s == TransferStatusEnum::COMPLETED) {
+                if (diagnostic) diagnostic->terminal_status = "completed";
                 engine_->freeBatchID(batch_id);
                 return 0;
             } else if (status.s == TransferStatusEnum::FAILED) {
+                if (diagnostic) diagnostic->terminal_status = "failed";
                 engine_->freeBatchID(batch_id);
                 already_freed = true;
                 completed = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
+                if (diagnostic) diagnostic->terminal_status = "timeout";
                 LOG(INFO) << "Sync data transfer timeout";
                 completed = true;
             }
@@ -661,6 +723,8 @@ int TransferEnginePy::batchTransferSync(
             const int64_t timeout =
                 transfer_timeout_nsec_ + total_length;  // 1GiB per second
             if (current_ts - start_ts > timeout) {
+                if (diagnostic && diagnostic->terminal_status == "waiting")
+                    diagnostic->terminal_status = "deadline_exceeded";
                 LOG(INFO) << "Sync batch data transfer timeout after "
                           << current_ts - start_ts << "ns";
                 // TODO: as @doujiang24 mentioned, early free(while there are
@@ -1259,6 +1323,11 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("transport_hint") = "")
             .def("batch_transfer_sync_write",
                  &TransferEnginePy::batchTransferSyncWrite,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("transport_hint") = "")
+            .def("batch_transfer_sync_write_diagnostic",
+                 &TransferEnginePy::batchTransferSyncWriteDiagnostic,
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("transport_hint") = "")

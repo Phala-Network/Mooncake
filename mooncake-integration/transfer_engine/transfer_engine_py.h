@@ -96,6 +96,11 @@ class TransferEnginePy {
                               std::vector<size_t> lengths,
                               const std::string &transport_hint = "");
 
+    pybind11::dict batchTransferSyncWriteDiagnostic(
+        const char *target_hostname, std::vector<uintptr_t> buffers,
+        std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
+        const std::string &transport_hint = "");
+
     batch_id_t batchTransferAsyncWrite(
         const char *target_hostname, const std::vector<uintptr_t> &buffers,
         const std::vector<uintptr_t> &peer_buffer_addresses,
@@ -205,6 +210,20 @@ class TransferEnginePy {
     uintptr_t getEnginePtr() const { return (uintptr_t)engine_.get(); }
 
    private:
+    struct BatchAttemptDiagnostic {
+        Transport::BatchTransportSelection selection;
+        std::string terminal_status = "not_submitted";
+        size_t transferred_bytes = 0;
+    };
+
+    int batchTransferSyncImpl(
+        const char *target_hostname, std::vector<uintptr_t> buffers,
+        std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
+        TransferOpcode opcode, TransferNotify *notify,
+        const std::string &transport_hint,
+        std::vector<BatchAttemptDiagnostic> *diagnostics = nullptr,
+        bool *diagnostics_truncated = nullptr);
+
     char *allocateRawBuffer(size_t capacity);
 
     int findClassId(size_t size);

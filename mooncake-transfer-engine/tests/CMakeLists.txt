@@ -19,6 +19,10 @@ target_link_libraries(transport_uint_test PUBLIC transfer_engine gtest
                                                  gtest_main)
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
 
+add_executable(pd_batch_diagnostics_test ${WORKSPACE}/pd_batch_diagnostics_test.cpp)
+target_link_libraries(pd_batch_diagnostics_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME pd_batch_diagnostics_test COMMAND pd_batch_diagnostics_test)
+
 # Hardware-free tests for FlagCX transport range and descriptor validation.
 add_executable(flagcx_transport_internal_test
                ${WORKSPACE}/flagcx_transport_internal_test.cpp)
