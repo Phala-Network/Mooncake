@@ -1,5 +1,7 @@
 #include "master_service.h"
 #include "shared_cache_diagnostics.h"
+#include <json/json.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -3338,15 +3340,13 @@ auto MasterService::BatchReplicaClear(
 
     for (const auto& key : object_keys) {
         if (key.empty()) {
-            LOG(WARNING) << "BatchReplicaClear: tenant=" << normalized_tenant
-                         << " empty key, skipping";
+            LOG(WARNING) << "BatchReplicaClear: empty_key";
             continue;
         }
         MetadataAccessorRW accessor(this,
                                     MakeObjectIdentity(key, normalized_tenant));
         if (!accessor.Exists()) {
-            LOG(WARNING) << "BatchReplicaClear: tenant=" << normalized_tenant
-                         << " key=" << key << " not found, skipping";
+            LOG(WARNING) << "BatchReplicaClear: not_found";
             continue;
         }
 
@@ -3354,17 +3354,13 @@ auto MasterService::BatchReplicaClear(
 
         // Security check: Ensure the requesting client owns the object.
         if (metadata.client_id != client_id) {
-            LOG(WARNING) << "BatchReplicaClear: tenant=" << normalized_tenant
-                         << " key=" << key << " belongs to different client_id="
-                         << metadata.client_id << ", expected=" << client_id
-                         << ", skipping";
+            LOG(WARNING) << "BatchReplicaClear: wrong_writer";
             continue;
         }
 
         // Safety check: Do not clear an object that has an active lease.
         if (!metadata.IsLeaseExpired()) {
-            LOG(WARNING) << "BatchReplicaClear: tenant=" << normalized_tenant
-                         << " key=" << key << " has active lease, skipping";
+            LOG(WARNING) << "BatchReplicaClear: active_lease";
             continue;
         }
 
@@ -3373,9 +3369,7 @@ auto MasterService::BatchReplicaClear(
             // indicate an ongoing Put operation, and clearing during this time
             // could lead to an inconsistent state or interfere with the write.
             if (!metadata.AllReplicas(&Replica::fn_is_completed)) {
-                LOG(WARNING)
-                    << "BatchReplicaClear: tenant=" << normalized_tenant
-                    << " key=" << key << " has incomplete replicas, skipping";
+                LOG(WARNING) << "BatchReplicaClear: incomplete_replica";
                 continue;
             }
 
@@ -3406,10 +3400,7 @@ auto MasterService::BatchReplicaClear(
                         continue;
                     }
                     cleared_keys.emplace_back(key);
-                    VLOG(1)
-                        << "BatchReplicaClear: tenant=" << normalized_tenant
-                        << " successfully cleared all replicas for key=" << key
-                        << " for client_id=" << client_id;
+                    VLOG(1) << "BatchReplicaClear: cleared_all";
                     continue;
                 }
             }
@@ -3419,9 +3410,7 @@ auto MasterService::BatchReplicaClear(
             // decrements disk_object_count via OnDiskReplicaRemoved.
             accessor.Erase();
             cleared_keys.emplace_back(key);
-            VLOG(1) << "BatchReplicaClear: tenant=" << normalized_tenant
-                    << " successfully cleared all replicas for key=" << key
-                    << " for client_id=" << client_id;
+            VLOG(1) << "BatchReplicaClear: cleared_all";
         } else {
             // Clear only replicas on the specified segment_name
             const auto match_replica_on_segment =
@@ -3440,11 +3429,7 @@ auto MasterService::BatchReplicaClear(
             };
 
             if (!metadata.HasReplica(match_replica_on_segment)) {
-                LOG(WARNING)
-                    << "BatchReplicaClear: tenant=" << normalized_tenant
-                    << " key=" << key
-                    << " has no replica on segment_name=" << segment_name
-                    << ", skipping";
+                LOG(WARNING) << "BatchReplicaClear: segment_not_found";
                 continue;
             }
 
@@ -3506,10 +3491,7 @@ auto MasterService::BatchReplicaClear(
                         continue;
                     }
                     cleared_keys.emplace_back(key);
-                    VLOG(1) << "BatchReplicaClear: tenant=" << normalized_tenant
-                            << " successfully cleared replicas on segment_name="
-                            << segment_name << " for key=" << key
-                            << " for client_id=" << client_id;
+                    VLOG(1) << "BatchReplicaClear: cleared_segment";
                     continue;
                 }
             }
@@ -3534,10 +3516,7 @@ auto MasterService::BatchReplicaClear(
             }
 
             cleared_keys.emplace_back(key);
-            VLOG(1) << "BatchReplicaClear: tenant=" << normalized_tenant
-                    << " successfully cleared replicas on segment_name="
-                    << segment_name << " for key=" << key
-                    << " for client_id=" << client_id;
+            VLOG(1) << "BatchReplicaClear: cleared_segment";
         }
     }
 
@@ -4017,6 +3996,130 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
     }
 
     return results;
+}
+
+std::optional<std::string> MasterService::GetFiniteSnapshotForAdmin(
+    const shared_cache_diagnostics::SnapshotRequest& request) {
+    try {
+        const TenantId tenant(request.identity.tenant_id);
+        if (!tenant.IsValid() ||
+            (!enable_multi_tenants_ && tenant != TenantId::Default()) ||
+            request.keys.empty() || request.keys.size() > 256 ||
+            request.max_response_bytes < 4096 ||
+            request.max_response_bytes > 1048576 ||
+            !request.max_total_logical_bytes ||
+            request.max_total_logical_bytes > 17179869184ULL)
+            return std::nullopt;
+        const auto timestamp = [](auto now) {
+            return Json::Int64(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch())
+                    .count());
+        };
+        const auto identifier = [&](const char* domain,
+                                    const std::string& value) {
+            return shared_cache_diagnostics::Identifier(
+                request.identity, domain, tenant.value(), value);
+        };
+        Json::Value payload;
+        payload["schema"] = "phala.shared-cache.snapshot.v1";
+        payload["success"] = true;
+        payload["case_id"] = request.identity.case_id;
+        payload["epoch"] = request.identity.epoch;
+        payload["sample_id"] = request.sample_id;
+        payload["tenant_id"] = tenant.value();
+        payload["requested_tenant_id"] = tenant.value();
+        payload["effective_tenant_id"] = tenant.value();
+        payload["master_multi_tenant_enabled"] = enable_multi_tenants_;
+        payload["master_pid"] = Json::Int64(getpid());
+        payload["sample_time_unix_ms"] =
+            timestamp(std::chrono::system_clock::now());
+        payload["lease_owner_available"] = false;
+        payload["generation_available"] = false;
+        payload["backend_drain_available"] = false;
+        payload["objects"] = Json::Value(Json::arrayValue);
+        uint64_t total = 0;
+        for (const auto& [id, key] : request.keys) {
+            if (std::chrono::steady_clock::now() >= request.deadline)
+                return std::nullopt;
+            Json::Value item;
+            item["key_id"] = id;
+            item["found"] = false;
+            std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+            MetadataAccessorRO accessor(this, MakeObjectIdentity(key, tenant));
+            if (accessor.Exists()) {
+                const auto& metadata = accessor.Get();
+                const auto* state = accessor.GetTenantState();
+                auto now = std::chrono::system_clock::now();
+                if (metadata.size > request.max_total_logical_bytes - total ||
+                    metadata.CountReplicas() > 64)
+                    return std::nullopt;
+                total += metadata.size;
+                item["found"] = true;
+                item["logical_bytes"] = Json::UInt64(metadata.size);
+                item["sample_time_unix_ms"] = timestamp(now);
+                item["writer_id"] =
+                    identifier("phala.shared-cache-owner.v1",
+                               UuidToString(metadata.client_id));
+                item["lease_expired"] = metadata.IsLeaseExpired(now);
+                item["pending"]["processing"] =
+                    Json::UInt64(accessor.InProcessing());
+                item["pending"]["offload"] =
+                    Json::UInt64(state->offloading_tasks.count(key));
+                item["pending"]["promotion"] =
+                    Json::UInt64(state->promotion_tasks.count(key));
+                item["pending"]["promotion_candidate"] =
+                    Json::UInt64(state->promotion_candidates.count(key));
+                item["pending"]["replication"] =
+                    Json::UInt64(state->replication_tasks.count(key));
+                item["pending"]["dynamic_replication"] =
+                    Json::UInt64(state->dynamic_replication_pending.count(key));
+                item["replicas"] = Json::Value(Json::arrayValue);
+                metadata.VisitReplicas(
+                    [](const Replica&) { return true; },
+                    [&](const Replica& replica) {
+                        Json::Value entry;
+                        std::ostringstream type, status;
+                        type << replica.type();
+                        status << replica.status();
+                        entry["id"] = Json::UInt64(replica.id());
+                        entry["type"] = type.str();
+                        entry["status"] = status.str();
+                        entry["readable"] = IsReplicaReadable(replica);
+                        entry["refcount"] = Json::UInt64(replica.get_refcnt());
+                        entry["segment_ids"] = Json::Value(Json::arrayValue);
+                        entry["owner_id"] = Json::Value();
+                        entry["scope_id"] = Json::Value();
+                        for (const auto& segment : replica.get_segment_names())
+                            if (segment)
+                                entry["segment_ids"].append(identifier(
+                                    "phala.shared-cache-segment.v1", *segment));
+                        if (replica.is_local_disk_replica()) {
+                            const auto descriptor =
+                                replica.get_descriptor()
+                                    .get_local_disk_descriptor();
+                            entry["owner_id"] =
+                                identifier("phala.shared-cache-owner.v1",
+                                           UuidToString(descriptor.client_id));
+                            entry["scope_id"] =
+                                identifier("phala.shared-cache-owner.v1",
+                                           descriptor.transport_endpoint);
+                        }
+                        item["replicas"].append(std::move(entry));
+                    });
+            }
+            payload["objects"].append(std::move(item));
+        }
+        Json::StreamWriterBuilder writer;
+        writer["indentation"] = "";
+        auto output = Json::writeString(writer, payload);
+        if (output.size() > request.max_response_bytes ||
+            std::chrono::steady_clock::now() >= request.deadline)
+            return std::nullopt;
+        return output;
+    } catch (...) {
+        return std::nullopt;
+    }
 }
 
 auto MasterService::AllocateAndInsertMetadata(

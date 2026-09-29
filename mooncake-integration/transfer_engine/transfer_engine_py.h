@@ -98,8 +98,8 @@ class TransferEnginePy {
 
     pybind11::dict batchTransferSyncWriteDiagnostic(
         const char *target_hostname, std::vector<uintptr_t> buffers,
-        std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
-        const std::string &transport_hint = "");
+        std::vector<uintptr_t> peer_buffer_addresses,
+        std::vector<size_t> lengths, const std::string &transport_hint = "");
 
     batch_id_t batchTransferAsyncWrite(
         const char *target_hostname, const std::vector<uintptr_t> &buffers,
@@ -218,9 +218,9 @@ class TransferEnginePy {
 
     int batchTransferSyncImpl(
         const char *target_hostname, std::vector<uintptr_t> buffers,
-        std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
-        TransferOpcode opcode, TransferNotify *notify,
-        const std::string &transport_hint,
+        std::vector<uintptr_t> peer_buffer_addresses,
+        std::vector<size_t> lengths, TransferOpcode opcode,
+        TransferNotify *notify, const std::string &transport_hint,
         std::vector<BatchAttemptDiagnostic> *diagnostics = nullptr,
         bool *diagnostics_truncated = nullptr);
 

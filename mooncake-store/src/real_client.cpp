@@ -6753,8 +6753,8 @@ RealClient::batch_get_replica_desc(const std::vector<std::string> &keys) {
         if (query_results[i]) {
             replica_map[keys[i]] = query_results[i].value().replicas;
         } else {
-            LOG(ERROR) << "batch_get_replica failed for key: " << keys[i]
-                       << " with error: " << toString(query_results[i].error());
+            LOG(ERROR) << "batch_get_replica failed: "
+                       << toString(query_results[i].error());
         }
     }
     return replica_map;

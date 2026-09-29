@@ -1,4 +1,5 @@
 #pragma once
+#include "shared_cache_diagnostics.h"
 
 #include <algorithm>
 #include <array>
@@ -457,6 +458,10 @@ class MasterService {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                                 const TenantId& tenant_id);
+    // Finite read-only diagnostic projection; no query/lease/promotion side
+    // effects.
+    std::optional<std::string> GetFiniteSnapshotForAdmin(
+        const shared_cache_diagnostics::SnapshotRequest& request);
 
     /**
      * @brief Start a put operation for an object

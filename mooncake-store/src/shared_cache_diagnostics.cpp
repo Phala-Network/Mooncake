@@ -228,12 +228,31 @@ Capture& Capture::Global() noexcept {
         std::thread worker;
         std::atomic<bool> stop{false};
         int fd = -1;
+        std::atomic<Capture*> active{nullptr};
+        std::atomic<bool> waiting{false};
+        std::mutex arm_mutex;
+        std::string manifest_path;
         Runtime() noexcept {
-            const char* path = std::getenv("MOONCAKE_SHARED_CACHE_DIAGNOSTICS_MANIFEST");
-            if (!path || !*path) return;
+            try {
+                const char* path =
+                    std::getenv("MOONCAKE_SHARED_CACHE_DIAGNOSTICS_MANIFEST");
+                if (!path || !*path) return;
+                manifest_path = path;
+                Load();
+            } catch (...) {
+            }
+        }
+        void Load() noexcept {
+            const char* path = manifest_path.c_str();
             int input = -1;
             try {
-                input = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+                input =
+                    open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+                if (input < 0 && errno == ENOENT) {
+                    waiting = true;
+                    return;
+                }
+                waiting = false;
                 struct stat st{};
                 if (input < 0 || fstat(input, &st) || !S_ISREG(st.st_mode) ||
                     st.st_uid != geteuid() || (st.st_mode & 077) || st.st_size <= 0 || st.st_size > 65536)
@@ -285,20 +304,176 @@ Capture& Capture::Global() noexcept {
                     WriteAll(fd,"{\"kind\":\"capture_summary\",\"complete\":false,\"writer_failed\":true}\n");
                   }
                 });
+                active.store(capture.get(), std::memory_order_release);
             } catch (...) {
                 if (input>=0) close(input);
                 if (fd>=0) { close(fd); fd=-1; }
                 capture.reset();
+                waiting = false;
                 // Fixed message only; parser errors can contain salt/input.
                 const char message[]="Mooncake shared cache diagnostics disabled: invalid manifest/output\n";
                 const auto written=write(STDERR_FILENO,message,sizeof(message)-1);
                 (void)written;
             }
         }
+        Capture& Get() noexcept {
+            if (auto* current = active.load(std::memory_order_acquire))
+                return *current;
+            if (!waiting.load()) return disabled;
+            try {
+                std::lock_guard<std::mutex> guard(arm_mutex);
+                if (auto* current = active.load(std::memory_order_acquire))
+                    return *current;
+                if (!waiting.load()) return disabled;
+                Load();
+                if (auto* current = active.load(std::memory_order_acquire))
+                    return *current;
+            } catch (...) {
+                waiting = false;
+            }
+            return disabled;
+        }
         ~Runtime() { stop=true; if(worker.joinable())worker.join(); if(fd>=0)close(fd); }
     };
     static Runtime runtime;
-    return runtime.capture ? *runtime.capture : runtime.disabled;
+    return runtime.Get();
+}
+
+std::optional<SnapshotRequest> AuthorizeSnapshot(
+    const std::string& tenant, const std::string& case_id,
+    const std::string& epoch, const std::string& sample_id,
+    const std::string& key_ids) noexcept {
+    struct Policy {
+        std::mutex mutex;
+        std::optional<SnapshotRequest> request;
+        std::unordered_set<std::string> samples;
+        uint64_t remaining = 0;
+        Policy() noexcept {
+            int fd = -1;
+            try {
+                const char* path =
+                    std::getenv("MOONCAKE_SHARED_CACHE_SNAPSHOT_MANIFEST");
+                if (!path || !*path) return;
+                fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+                struct stat st{};
+                if (fd < 0 || fstat(fd, &st) || !S_ISREG(st.st_mode) ||
+                    st.st_uid != geteuid() || (st.st_mode & 0777) != 0600 ||
+                    st.st_size <= 0 || st.st_size > 65536)
+                    throw std::invalid_argument("manifest");
+                std::string data(static_cast<size_t>(st.st_size), '\0');
+                size_t pos = 0;
+                while (pos < data.size()) {
+                    const auto n =
+                        read(fd, data.data() + pos, data.size() - pos);
+                    if (n < 0 && errno == EINTR) continue;
+                    if (n <= 0) throw std::invalid_argument("manifest");
+                    pos += static_cast<size_t>(n);
+                }
+                close(fd);
+                fd = -1;
+                Json::CharReaderBuilder reader;
+                reader["rejectDupKeys"] = true;
+                reader["failIfExtra"] = true;
+                Json::Value v;
+                std::string errors;
+                std::unique_ptr<Json::CharReader> parser(
+                    reader.newCharReader());
+                if (!parser->parse(data.data(), data.data() + data.size(), &v,
+                                   &errors) ||
+                    !v.isObject())
+                    throw std::invalid_argument("manifest");
+                for (const char* name :
+                     {"tenant_id", "case_id", "epoch", "key_salt"})
+                    if (!v[name].isString())
+                        throw std::invalid_argument("manifest");
+                for (const char* name :
+                     {"max_snapshots", "max_duration_ms", "max_response_bytes",
+                      "max_total_logical_bytes"})
+                    if (!v[name].isUInt64())
+                        throw std::invalid_argument("manifest");
+                SnapshotRequest q;
+                q.identity.tenant_id = v["tenant_id"].asString();
+                q.identity.case_id = v["case_id"].asString();
+                q.identity.epoch = v["epoch"].asString();
+                q.identity.key_salt = v["key_salt"].asString();
+                remaining = v["max_snapshots"].asUInt64();
+                const auto duration = v["max_duration_ms"].asUInt64();
+                q.max_response_bytes = v["max_response_bytes"].asUInt64();
+                q.max_total_logical_bytes =
+                    v["max_total_logical_bytes"].asUInt64();
+                if (!Label(q.identity.case_id) || !Label(q.identity.epoch) ||
+                    q.identity.tenant_id.empty() ||
+                    q.identity.tenant_id.size() > 256 ||
+                    q.identity.key_salt.size() < 16 ||
+                    q.identity.key_salt.size() > 256 || !remaining ||
+                    remaining > 16 || !duration || duration > 120000 ||
+                    q.max_response_bytes < 4096 ||
+                    q.max_response_bytes > 1048576 ||
+                    !q.max_total_logical_bytes ||
+                    q.max_total_logical_bytes > 17179869184ULL ||
+                    !v["keys"].isArray() || v["keys"].empty() ||
+                    v["keys"].size() > 256)
+                    throw std::invalid_argument("manifest");
+                std::unordered_set<std::string> ids;
+                for (const auto& item : v["keys"]) {
+                    if (!item["key"].isString() || !item["key_id"].isString())
+                        throw std::invalid_argument("manifest");
+                    auto key = item["key"].asString();
+                    auto id = item["key_id"].asString();
+                    if (key.empty() || key.size() > 4096 ||
+                        key.find_first_of(",*?[]") != std::string::npos ||
+                        !Hex(id) || !ids.insert(id).second)
+                        throw std::invalid_argument("manifest");
+                    for (unsigned char c : key)
+                        if (c < 32 || c == 127)
+                            throw std::invalid_argument("manifest");
+                    if (Identifier(q.identity, "phala.shared-cache-key.v1",
+                                   q.identity.tenant_id, key) != id)
+                        throw std::invalid_argument("manifest");
+                    q.keys.emplace_back(std::move(id), std::move(key));
+                }
+                q.deadline = Clock::now() + std::chrono::milliseconds(duration);
+                request = std::move(q);
+            } catch (...) {
+                if (fd >= 0) close(fd);
+                request.reset();
+                remaining = 0;
+            }
+        }
+    };
+    static Policy policy;
+    try {
+        std::lock_guard<std::mutex> guard(policy.mutex);
+        if (!policy.request || !policy.remaining ||
+            Clock::now() >= policy.request->deadline || !Label(sample_id) ||
+            key_ids.size() > 16640 ||
+            tenant != policy.request->identity.tenant_id ||
+            case_id != policy.request->identity.case_id ||
+            epoch != policy.request->identity.epoch ||
+            policy.samples.count(sample_id))
+            return std::nullopt;
+        std::unordered_set<std::string> requested;
+        size_t start = 0;
+        while (start <= key_ids.size()) {
+            const auto end = key_ids.find(',', start);
+            const auto id = key_ids.substr(
+                start, end == std::string::npos ? end : end - start);
+            if (!Hex(id) || !requested.insert(id).second) return std::nullopt;
+            if (end == std::string::npos) break;
+            start = end + 1;
+        }
+        if (requested.size() != policy.request->keys.size())
+            return std::nullopt;
+        for (const auto& key : policy.request->keys)
+            if (!requested.count(key.first)) return std::nullopt;
+        auto result = *policy.request;
+        result.sample_id = sample_id;
+        policy.samples.insert(sample_id);
+        --policy.remaining;
+        return result;
+    } catch (...) {
+        return std::nullopt;
+    }
 }
 
 }  // namespace mooncake::shared_cache_diagnostics

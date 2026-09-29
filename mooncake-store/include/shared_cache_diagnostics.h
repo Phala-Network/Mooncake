@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <chrono>
+#include <optional>
+#include <utility>
 #include <memory>
 #include <string>
 #include <vector>
@@ -60,6 +63,19 @@ struct Snapshot {
     uint64_t emitted = 0, dropped = 0, rejected = 0, bytes = 0;
     bool complete = true;
 };
+
+// Privileged finite admin snapshot. Raw keys/salt remain process-local.
+struct SnapshotRequest {
+    Config identity;
+    std::string sample_id;
+    std::vector<std::pair<std::string, std::string>> keys;  // id, raw key
+    uint64_t max_response_bytes = 0, max_total_logical_bytes = 0;
+    std::chrono::steady_clock::time_point deadline;
+};
+std::optional<SnapshotRequest> AuthorizeSnapshot(
+    const std::string& tenant, const std::string& case_id,
+    const std::string& epoch, const std::string& sample_id,
+    const std::string& key_ids) noexcept;
 
 // Bounded collector; no capture initialization or key hashing when disabled.
 // Never changes serving results, including on allocation/serialization errors.

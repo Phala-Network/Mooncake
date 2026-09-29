@@ -391,7 +391,8 @@ class TransferEngineImpl {
 
     Status getBatchTransportSelection(
         BatchID batch_id, Transport::BatchTransportSelection& selection) {
-        return multi_transports_->getBatchTransportSelection(batch_id, selection);
+        return multi_transports_->getBatchTransportSelection(batch_id,
+                                                             selection);
     }
 
     bool isTcpOnly() const { return multi_transports_->isTcpOnly(); }

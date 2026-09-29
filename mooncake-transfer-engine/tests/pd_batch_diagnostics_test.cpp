@@ -11,7 +11,8 @@ class CompletingTransport : public Transport {
     TransferStatusEnum next = TransferStatusEnum::WAITING;
     size_t bytes = 0;
     size_t polls = 0;
-    Status submitTransfer(BatchID, const std::vector<TransferRequest>&) override {
+    Status submitTransfer(BatchID,
+                          const std::vector<TransferRequest>&) override {
         return Status::OK();
     }
     Status getTransferStatus(BatchID id, size_t task_id,
@@ -20,15 +21,25 @@ class CompletingTransport : public Transport {
         status.s = next;
         status.transferred_bytes = bytes;
         if (next != TransferStatusEnum::WAITING)
-            reinterpret_cast<BatchDesc*>(id)->task_list[task_id].is_finished = true;
+            reinterpret_cast<BatchDesc*>(id)->task_list[task_id].is_finished =
+                true;
         return Status::OK();
     }
+
    private:
     const char* getName() const override { return name_; }
-    int registerLocalMemory(void*, size_t, const std::string&, bool, bool) override { return 0; }
+    int registerLocalMemory(void*, size_t, const std::string&, bool,
+                            bool) override {
+        return 0;
+    }
     int unregisterLocalMemory(void*, bool) override { return 0; }
-    int registerLocalMemoryBatch(const std::vector<BufferEntry>&, const std::string&) override { return 0; }
-    int unregisterLocalMemoryBatch(const std::vector<void*>&) override { return 0; }
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>&,
+                                 const std::string&) override {
+        return 0;
+    }
+    int unregisterLocalMemoryBatch(const std::vector<void*>&) override {
+        return 0;
+    }
     const char* name_;
 };
 
@@ -92,7 +103,8 @@ TEST(PDBatchDiagnostics, EmptyAndMissingTransportCannotProveNvlink) {
     ASSERT_TRUE(engine.getBatchTransportSelection(id, selection).ok());
     EXPECT_EQ(selection.task_count, 0);
     EXPECT_TRUE(selection.selected_transports.empty());
-    auto& task = reinterpret_cast<Transport::BatchDesc*>(id)->task_list.emplace_back();
+    auto& task =
+        reinterpret_cast<Transport::BatchDesc*>(id)->task_list.emplace_back();
     task.is_finished = true;
     ASSERT_TRUE(engine.getBatchTransportSelection(id, selection).ok());
     EXPECT_EQ(selection.task_count, 1);

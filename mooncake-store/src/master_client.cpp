@@ -48,6 +48,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchQueryIp> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchReplicaClearForTenant> {
+    static constexpr const char* value = "BatchReplicaClearForTenant";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchReplicaClear> {
     static constexpr const char* value = "BatchReplicaClear";
 };
@@ -514,13 +519,16 @@ MasterClient::BatchReplicaClear(const std::vector<std::string>& object_keys,
                                 const UUID& client_id,
                                 const std::string& segment_name) {
     ScopedVLogTimer timer(1, "MasterClient::BatchReplicaClear");
-    timer.LogRequest("object_keys_count=", object_keys.size(),
-                     ", client_id=", client_id,
-                     ", segment_name=", segment_name);
-    auto result = invoke_rpc<&WrappedMasterService::BatchReplicaClear,
-                             std::vector<std::string>>(object_keys, client_id,
-                                                       segment_name);
-    timer.LogResponseExpected(result);
+    timer.LogRequest("object_keys_count=", object_keys.size());
+    auto result =
+        tenant_id_ == TenantId::Default()
+            ? invoke_rpc<&WrappedMasterService::BatchReplicaClear,
+                         std::vector<std::string>>(object_keys, client_id,
+                                                   segment_name)
+            : invoke_rpc<&WrappedMasterService::BatchReplicaClearForTenant,
+                         std::vector<std::string>>(
+                  object_keys, client_id, segment_name, tenant_id_.value());
+    timer.LogResponse("success=", result.has_value());
     return result;
 }
 

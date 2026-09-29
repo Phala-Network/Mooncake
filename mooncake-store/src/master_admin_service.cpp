@@ -1,4 +1,5 @@
 #include "master_admin_service.h"
+#include <set>
 
 #include <algorithm>
 #include <chrono>
@@ -995,6 +996,72 @@ YLT_REFL(HttpBatchQueryKeysResponse, success, data);
 void MasterAdminServer::HandleBatchQueryKeys(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
     WithActiveService(resp, [&](auto service) {
+        const auto finite = req.get_query_value("finite_snapshot");
+        if (req.get_queries().count("finite_snapshot")) {
+            auto reject = [&] {
+                WriteSimpleErrorResponse(resp,
+                                         coro_http::status_type::bad_request,
+                                         "finite_snapshot_rejected");
+            };
+            try {
+                // Parse the bounded raw query as well: the HTTP parser's map
+                // silently folds duplicate parameters. Accept only six exact
+                // field names, once each, and never accept raw keys here.
+                const auto url = req.full_url();
+                if (url.size() > 18000) {
+                    reject();
+                    return;
+                }
+                auto query = url.substr(url.find('?') + 1);
+                std::set<std::string_view> fields;
+                while (!query.empty()) {
+                    const auto end = query.find('&');
+                    const auto field = query.substr(0, end);
+                    const auto name = field.substr(0, field.find('='));
+                    if ((name != "finite_snapshot" && name != "tenant_id" &&
+                         name != "case_id" && name != "epoch" &&
+                         name != "sample_id" && name != "key_ids") ||
+                        !fields.insert(name).second) {
+                        reject();
+                        return;
+                    }
+                    if (end == std::string_view::npos) break;
+                    query.remove_prefix(end + 1);
+                }
+                if (fields.size() != 6) {
+                    reject();
+                    return;
+                }
+                auto tenant = ParseAdminTenantId(req);
+                if (finite != "1" || !tenant ||
+                    !req.get_query_value("keys").empty()) {
+                    reject();
+                    return;
+                }
+                auto request = shared_cache_diagnostics::AuthorizeSnapshot(
+                    *tenant, std::string(req.get_decode_query_value("case_id")),
+                    std::string(req.get_decode_query_value("epoch")),
+                    std::string(req.get_decode_query_value("sample_id")),
+                    std::string(req.get_decode_query_value("key_ids")));
+                if (!request) {
+                    reject();
+                    return;
+                }
+                auto output = service->GetFiniteSnapshotForAdmin(*request);
+                if (!output) {
+                    reject();
+                    return;
+                }
+                resp.add_header("Content-Type",
+                                "application/json; charset=utf-8");
+                resp.set_status_and_content(coro_http::status_type::ok,
+                                            std::move(*output));
+            } catch (...) {
+                reject();
+            }
+            return;
+        }
+
         auto keys_str = req.get_decode_query_value("keys");
         std::vector<std::string> keys;
         if (!keys_str.empty()) {

@@ -5,6 +5,8 @@
 #include <chrono>
 #include <iostream>
 #include <thread>
+#include <filesystem>
+#include <cstdlib>
 
 using namespace mooncake::shared_cache_diagnostics;
 
@@ -16,7 +18,39 @@ Config Fixture() {
     return c;
 }
 
-int main(int argc, char**) {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--snapshot-policy") {
+        auto q = AuthorizeSnapshot("default", "case1", "epoch1", "sample1",
+                                   Fixture().key_ids[0]);
+        if (!q) return 3;
+        assert(!AuthorizeSnapshot("default", "case1", "epoch1", "sample1",
+                                  Fixture().key_ids[0]));
+        return 0;
+    }
+    if (argc > 2 && std::string(argv[1]).rfind("--late", 0) == 0) {
+        assert(!Capture::Global().Enabled());
+        if (std::string(argv[1]) == "--late-delayed")
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const auto manifest =
+            std::getenv("MOONCAKE_SHARED_CACHE_DIAGNOSTICS_MANIFEST");
+        std::filesystem::rename(argv[2], manifest);
+        if (std::string(argv[1]) == "--late-invalid") {
+            assert(!Capture::Global().Enabled());
+            std::filesystem::rename(argv[3], manifest);
+            return Capture::Global().Enabled() ? 9 : 3;
+        }
+        if (!Capture::Global().Enabled()) return 3;
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 8; ++i)
+            threads.emplace_back([] {
+                auto& capture = Capture::Global();
+                assert(capture.Enabled());
+                Event event{Kind::BackendRead};
+                capture.Emit("default", "component-key", event);
+            });
+        for (auto& thread : threads) thread.join();
+        return 0;
+    }
     if (argc>1) {
         auto& runtime=Capture::Global();
         if (!runtime.Enabled()) return 3;

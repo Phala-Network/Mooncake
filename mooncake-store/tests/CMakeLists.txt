@@ -37,6 +37,7 @@ endfunction()
 
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(shared_cache_diagnostics_test shared_cache_diagnostics_test.cpp)
+add_store_test(finite_snapshot_test finite_snapshot_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)

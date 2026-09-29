@@ -22,16 +22,24 @@ class NativeBatchDiagnosticsTest(unittest.TestCase):
         source, destination = TransferEngine(), TransferEngine()
         source_name, destination_name = endpoint(), endpoint()
         self.assertEqual(source.initialize(source_name, "P2PHANDSHAKE", "tcp", ""), 0)
-        self.assertEqual(destination.initialize(destination_name, "P2PHANDSHAKE", "tcp", ""), 0)
+        self.assertEqual(
+            destination.initialize(destination_name, "P2PHANDSHAKE", "tcp", ""), 0
+        )
+        destination_name = f"127.0.0.1:{destination.get_rpc_port()}"
         payload = ctypes.create_string_buffer(bytes(range(256)) * 32)
         target = ctypes.create_string_buffer(len(payload))
-        source_address, target_address = ctypes.addressof(payload), ctypes.addressof(target)
+        source_address, target_address = (
+            ctypes.addressof(payload),
+            ctypes.addressof(target),
+        )
         self.assertEqual(source.register_memory(source_address, len(payload)), 0)
         self.assertEqual(destination.register_memory(target_address, len(target)), 0)
         sizes = [4096, len(payload) - 4096]
         record = source.batch_transfer_sync_write_diagnostic(
-            destination_name, [source_address, source_address + 4096],
-            [target_address, target_address + 4096], sizes,
+            destination_name,
+            [source_address, source_address + 4096],
+            [target_address, target_address + 4096],
+            sizes,
         )
         self.assertEqual(record["result"], 0)
         self.assertFalse(record["diagnostics_truncated"])
@@ -42,7 +50,9 @@ class NativeBatchDiagnosticsTest(unittest.TestCase):
         self.assertEqual(native["selected_transports"], {"tcp": 2})
         self.assertEqual(native["missing_transports"], 0)
         self.assertEqual(target.raw, payload.raw)
-        empty = source.batch_transfer_sync_write_diagnostic(destination_name, [], [], [])
+        empty = source.batch_transfer_sync_write_diagnostic(
+            destination_name, [], [], []
+        )
         self.assertEqual(empty["result"], 0)
         self.assertEqual(empty["attempts"][0]["task_count"], 0)
         invalid = source.batch_transfer_sync_write_diagnostic(

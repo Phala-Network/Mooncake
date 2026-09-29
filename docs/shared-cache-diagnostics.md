@@ -2,7 +2,7 @@
 
 Base: Mooncake `e5598b0992cc258b06d22f24d875480e8931a28e`.
 This is an unpublished source candidate. It does not qualify a GPU request or
-authorize a live clear. The existing API and cache selection remain unchanged.
+authorize a live clear. The Python API and cache selection remain unchanged; nondefault clear RPC routing is made tenant-aware.
 
 ## Capture contract
 
@@ -43,6 +43,52 @@ written at shutdown/deadline; any dropped event, ambiguous repeated key or
 writer failure makes `complete=false`. Missing summary is inconclusive.
 Unknown keys are counted as rejected, never emitted. Disabling capture does
 not hash keys or serialize objects; the io_uring event loop is also gated.
+
+## Sealed-manifest activation and finite metadata snapshot
+
+A missing configured event manifest (ENOENT) can be atomically published after
+model readiness and seed/warmup completion without restarting the store. The
+fixed path is retained on first `Capture::Global()`; absent means unarmed, so
+no event duration is consumed during model loading. Later hooks retry only
+that path, without background polling. An invalid existing manifest/output
+disables capture permanently. Successful activation is one-time: no reload,
+salt change or allowlist replacement. The bounded event duration starts on
+activation. Actual donor PUT provenance and whole-backup ACK remain the engine
+seed producer's responsibility; native pre-seal PUT capture is not claimed.
+
+Existing admin GET `/batch_query_keys` accepts a default-off finite mode with
+exactly six unique parameters: `finite_snapshot=1`, `tenant_id`, `case_id`,
+`epoch`, `sample_id`, `key_ids` (comma-separated full HMACs). URL <=18000 bytes;
+raw `keys`, unknown/duplicate fields, duplicate/subset/unknown IDs are rejected.
+The independent `MOONCAKE_SHARED_CACHE_SNAPSHOT_MANIFEST` must be an owned
+regular mode0600 file <=64KiB, no symlink. It contains case/epoch/tenant/salt,
+`keys:[{key_id,key}]`, `max_snapshots` (1..16), `max_duration_ms` (1..120000),
+`max_response_bytes` (4096..1048576), `max_total_logical_bytes` (1..17179869184).
+The exact <=256 keys must be nonempty, <=4096 bytes and contain no control,
+comma or wildcard characters. First request loads once; samples cannot replay.
+
+`phala.shared-cache.snapshot.v1` includes case/epoch/sample, actual master PID,
+sample times, requested/effective tenant, actual `master_multi_tenant_enabled`,
+and each key's existence, logical bytes, original writer HMAC, authoritative
+`IsLeaseExpired`, all replica IDs/types/statuses/readability/refcounts, segment
+HMACs, SSD owner/scope HMACs, and actual processing/offload/promotion/candidate/
+replication/dynamic-replication membership. Segment HMAC domain is
+`phala.shared-cache-segment.v1`; writer and SSD UUIDs use canonical
+`UuidToString` and the owner domain. Owner scope uses the actual endpoint.
+Unsupported lease owner, generation and backend drain are explicitly marked
+unavailable. Per-key state is sampled under one RO accessor; the entire batch
+is not atomic. No Query/Exist/GET, lease renewal, promotion or backend I/O occurs.
+
+Native master defaults to single-tenant mode: ordinary requests then resolve
+to `default`, regardless of the worker's tenant configuration. Finite snapshot
+and the new internal tenant-aware clear reject nondefault tenants when mode is
+disabled. An isolated experiment must enable multi-tenancy and supply its quota
+policy before seeding, or explicitly use actual single-tenant semantics. This
+patch does not migrate existing objects or prove a live tenant configuration.
+`MasterClient::BatchReplicaClear` preserves the old three-argument RPC for
+`default`; nondefault uses `BatchReplicaClearForTenant` with no fallback on an
+old master. Writer/lease checks remain authoritative. Clear request/result
+logs and the reviewed descriptor-query error log contain no raw identifiers.
 
 ## Actual hooks and limits
 

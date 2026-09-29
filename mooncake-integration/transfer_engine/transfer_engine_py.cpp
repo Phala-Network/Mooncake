@@ -465,7 +465,8 @@ pybind11::dict TransferEnginePy::batchTransferSyncWriteDiagnostic(
     std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
     const std::string& transport_hint) {
     static std::atomic<uint64_t> sequence{0};
-    const auto batch_sequence = sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto batch_sequence =
+        sequence.fetch_add(1, std::memory_order_relaxed) + 1;
     std::vector<BatchAttemptDiagnostic> diagnostics;
     bool truncated = false;
     const int result = batchTransferSyncImpl(
@@ -680,7 +681,8 @@ int TransferEnginePy::batchTransferSyncImpl(
         if (diagnostic) {
             auto selected = engine_->getBatchTransportSelection(
                 batch_id, diagnostic->selection);
-            if (!selected.ok()) diagnostic->selection.missing_transports = batch_size;
+            if (!selected.ok())
+                diagnostic->selection.missing_transports = batch_size;
             diagnostic->terminal_status = s.ok() ? "waiting" : "submit_failed";
         }
         if (!s.ok()) {
@@ -688,8 +690,8 @@ int TransferEnginePy::batchTransferSyncImpl(
             Status segment_status = engine_->CheckSegmentStatus(handle);
             if (!segment_status.ok()) {
                 LOG(WARNING)
-                    << "submitTransfer failed with target " << target_hostname
-                    << ", CheckSegmentStatus not ok, ready to closeSegment";
+                    << "submitTransfer failed, CheckSegmentStatus not ok, "
+                       "ready to closeSegment";
                 std::lock_guard<std::mutex> guard(mutex_);
                 engine_->closeSegment(handle);
                 engine_->getMetadata()->removeSegmentDesc(target_hostname);
@@ -704,7 +706,8 @@ int TransferEnginePy::batchTransferSyncImpl(
         while (!completed) {
             Status s = engine_->getBatchTransferStatus(batch_id, status);
             LOG_ASSERT(s.ok());
-            if (diagnostic) diagnostic->transferred_bytes = status.transferred_bytes;
+            if (diagnostic)
+                diagnostic->transferred_bytes = status.transferred_bytes;
             if (status.s == TransferStatusEnum::COMPLETED) {
                 if (diagnostic) diagnostic->terminal_status = "completed";
                 engine_->freeBatchID(batch_id);

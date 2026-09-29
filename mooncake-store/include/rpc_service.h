@@ -53,6 +53,16 @@ class WrappedMasterService {
         const std::vector<std::string>& object_keys, const UUID& client_id,
         const std::string& segment_name);
 
+    // Backward-compatible internal dispatch for non-default clients. Never
+    // falls back to the legacy default-tenant RPC on an old master.
+    tl::expected<std::vector<std::string>, ErrorCode>
+    BatchReplicaClearForTenant(const std::vector<std::string>& object_keys,
+                               const UUID& client_id,
+                               const std::string& segment_name,
+                               const std::string& tenant_id);
+    std::optional<std::string> GetFiniteSnapshotForAdmin(
+        const shared_cache_diagnostics::SnapshotRequest& request);
+
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode>
