@@ -1,3 +1,4 @@
+#include "shared_cache_diagnostics.h"
 // Unit tests for the L2->L1 promotion-on-hit master-side path. Exercises
 // the master-service entry points directly without going through the RPC
 // layer.
@@ -3243,5 +3244,6 @@ TEST_F(PromotionOnHitTest, RetryCandidate_ClearOnReload) {
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
+    (void)mooncake::shared_cache_diagnostics::Capture::Global();
     return RUN_ALL_TESTS();
 }

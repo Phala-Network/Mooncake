@@ -86,6 +86,7 @@ class SharedCacheReadTrace {
         if (!enabled_) return;
         try {
             scd::Event event{scd::Kind::SelectedRead};
+            event.purpose=scd::ReadPurpose::ConsumerGet;
             event.tier = r.is_memory_replica() ? scd::Tier::Memory :
                          r.is_nof_replica() ? scd::Tier::NoF :
                          r.is_local_disk_replica() ? scd::Tier::LocalDisk :

@@ -1,3 +1,4 @@
+#include "shared_cache_diagnostics.h"
 #include "file_storage.h"
 
 #include <algorithm>
@@ -246,7 +247,11 @@ FileStorage::LoadBatch(const std::vector<std::string>& keys,
         return tl::make_unexpected(allocate_res.error());
     }
     auto allocated_batch = std::move(allocate_res.value());
-    auto result = BatchLoad(allocated_batch->slices);
+    auto result = [&] {
+        shared_cache_diagnostics::ReadPurposeScope diagnostic_purpose(
+            shared_cache_diagnostics::ReadPurpose::ConsumerGet);
+        return BatchLoad(allocated_batch->slices);
+    }();
     if (!result) {
         LOG(ERROR) << "Batch load object failed,err_code = " << result.error();
         return tl::make_unexpected(result.error());
@@ -953,7 +958,11 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
             continue;
         }
         auto staging = allocate_res.value();
-        auto load_res = BatchLoad(staging->slices);
+        auto load_res = [&] {
+            shared_cache_diagnostics::ReadPurposeScope diagnostic_purpose(
+                shared_cache_diagnostics::ReadPurpose::Promotion);
+            return BatchLoad(staging->slices);
+        }();
         if (!load_res) {
             LOG(WARNING) << "Promotion: BatchLoad failed for key=" << key
                          << ", error=" << load_res.error();

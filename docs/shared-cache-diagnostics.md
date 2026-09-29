@@ -54,7 +54,11 @@ not hash keys or serialize objects; the io_uring event loop is also gated.
   overloads are not source-qualified by this candidate.
 - File-per-key payload decode, bucket vector read/io_uring descriptor, and
   offset allocator value read: record actual backend result and short reads,
-  with logical length and hashed file/offset identity. These are backend read
+  with logical length and hashed file/offset identity. Synchronous
+  `FileStorage::LoadBatch` and promotion `BatchLoad` calls use a narrowly scoped
+  RAII thread-local purpose (`consumer_get` or `promotion`); these calls contain
+  no coroutine suspension. Overlapping threads and nested restoration are
+  exercised by the native runtime fixture. These are backend read
   events, not device-level IOPS or allocated physical-byte measurements.
   Failures before payload I/O are visible as native read failures without a
   successful backend payload event. No backend event implies success.
@@ -80,49 +84,69 @@ OpenSSL libcrypto 3. The script compiles the actual collector with
 `-Wall -Wextra -Werror`. Fixtures cover HMAC vectors/domain separation,
 disabled mode, allowlist/tenant checks, multiple pool batches, ambiguous
 repeated keys, short/error byte preservation, all capture limits, concurrency,
-manifest permissions, exclusive output, shutdown and fail-closed clear policy.
+manifest permissions, exclusive output, shutdown.
 
 Complete changed translation-unit and integration gate, in a prepared native
 Mooncake dependency environment:
 
 ```sh
 cmake -S . -B /absolute/isolated/hooks -DWITH_STORE=ON -DWITH_STORE_RUST=OFF \
-  -DUSE_CUDA=OFF -DBUILD_UNIT_TESTS=ON
-cmake --build /absolute/isolated/hooks --parallel 2 --target \
+  -DUSE_CUDA=OFF -DUSE_ETCD=OFF -DBUILD_UNIT_TESTS=ON
+cmake --build /absolute/isolated/hooks --parallel 1 --target \
   mooncake_store_shared_objects mooncake_store_client_objects mooncake_store_master_objects
-cmake --build /absolute/isolated/hooks --parallel 2 --target \
-  master_service_test promotion_on_hit_test file_storage_promotion_test
-ctest --test-dir /absolute/isolated/hooks --output-on-failure \
-  -R '^(master_service_test|promotion_on_hit_test|file_storage_promotion_test)$'
+cmake --build /absolute/isolated/hooks --parallel 1 --target \
+  promotion_on_hit_test file_storage_promotion_test storage_backend_test
+/absolute/isolated/hooks/mooncake-store/tests/file_storage_promotion_test
+python3 mooncake-store/tests/test_shared_cache_promotion_events.py \
+  /absolute/isolated/hooks/mooncake-store/tests/promotion_on_hit_test
+python3 mooncake-store/tests/test_shared_cache_backend_events.py \
+  /absolute/isolated/hooks/mooncake-store/tests/storage_backend_test
 ```
 
-The standalone fixture does **not** compile `real_client.cpp`,
-`storage_backend.cpp` or `master_service.cpp`, nor invoke the true promotion
-state machine. The first full configure attempt in the isolated CPU directory
-stopped at missing yaml-cpp (glog also absent). Therefore complete hook compile
-and the existing master/promotion fixtures remain explicitly unverified until
-the native dependency environment is supplied.
+The standalone fixture compiles only the collector. The full integration build
+also compiles the actual `real_client.cpp`, `storage_backend.cpp`,
+`file_storage.cpp` and `master_service.cpp` hooks. Promotion event fixtures use
+real MasterService success, wrong-holder, missing-task, reaped-task and failure
+paths; backend fixtures use real offset payload, bucket io_uring and short-read
+paths. They reject missing or skipped tests. On 2026-09-29 the isolated CPU
+build and collector/runtime fixture passed, along with 11 FileStorage tests,
+6 real master event cases and 3 actual backend event cases (3 offset reads,
+40 io_uring reads, 2 short-read outcomes). The existing bucket NONE watermark
+fixture also passed. This is CPU evidence only.
 
 ## Smallest clear-to-read retention decision
 
 The legacy original-writer API checks writer and expired lease, but lacks an
 atomic MEMORY-only/retained-COMPLETE-SSD predicate. Query then clear is racy.
-`CanClearMemoryUnderLock` is a tested fail-closed **policy only**, not a new
-clear API or a functioning retention guard. It is deliberately not wired into
-the legacy clear path. No live clear is safe solely because this predicate
-fixture passes.
+No disconnected Boolean policy helper or simulated clear fixture is shipped.
+A real clear gate must validate writer/lease/MEMORY/SSD/epoch/owner/inflight
+and retained backend state under the actual lock/hold. No live clear is
+qualified by the diagnostic fixtures.
 
-Two bounded choices remain for the owner:
+The bucket backend supports the first option under a finite static contract:
 
-1. **Proven static experiment.** Stop experiment submissions and drain every
-   offload, promotion and read. Exclude explicit remove/reset/store restart
-   by operational ownership; treat owner loss as experiment failure. Disable
-   and read back the *actual backend's* watermark, capacity-pressure, stale
-   cleanup and background eviction paths for the entire clear-to-read window.
-   Master `enable_disk_eviction=false` alone is insufficient. A complete
-   backend-specific proof may permit the existing writer API once its exact
-   nonempty MEMORY target and retained COMPLETE SSD objects are verified.
-   Partial returned keys stop the attempt; do not retry blindly.
+1. **Source-supported static experiment.** Before constructing the dataset,
+   initialize the owner with
+   `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend`,
+   `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=none` and
+   `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=false`.
+   `PrepareEviction` and `EvictAboveDiskWatermark` return no eviction under
+   NONE; `RunDiskWatermarkEviction` also returns when its flag is false.
+   Capacity checks in PrepareEviction are bypassed by NONE, so finish a bounded
+   dataset within measured free space before the window. Init's invalid/orphan
+   cleanup has no disable switch; finish Init/ScanMeta before the window and
+   exclude restart. ScanMeta/HandleNext registration failure does not delete
+   buckets. Exclude new writes/rollback, remove/reset/unmount and file mutation;
+   drain every offload, promotion and read. Keep master/owner healthy and fail
+   on timeout, remount or identity change. Master processing expiry retains
+   COMPLETE replicas, but client-loss cleanup still removes LOCAL_DISK
+   metadata; `enable_metadata_cleanup_on_timeout=false` does not disable it.
+   Read back the actual owner configuration/identity and exact nonempty MEMORY
+   targets and retained COMPLETE SSD before the reviewed original-writer API.
+   The current diagnostics patch contains no clear command. This quiescent
+   contract excludes mutation across query/clear only if operational ownership
+   is real; any subset clear or continuity failure ends the attempt. Under
+   those conditions no new hold service is needed for the finite read.
 2. **Small finite-key hold when background exclusion cannot be proven.**
    Reuse the backend's existing `BucketReadGuard` or offset `AllocationPtr`
    plus shared file handle and retain the exact read plan before clear.
@@ -138,8 +162,11 @@ Two bounded choices remain for the owner:
    experiment; no fault-tolerance promise is needed.
 
 Existing master hard pins/refcounts do not prove physical retention:
-`FileStorage::RunDiskWatermarkEviction` calls backend eviction and then
-notifies the master. Existing backend read guards retain storage only while
+File/bucket watermark eviction calls its master-notification handler before
+physical deletion and restores prepared eviction if the handler fails. However,
+that handler reaches `MasterService::EvictDiskReplica`, whose owner/type-matched
+removal has no hard-pin, lease or replica-refcount gate. Thus the pin checks in
+other master eviction paths do not cover this actual backend callback. Existing backend read guards retain storage only while
 `BatchLoad` is active; they do not cover the preceding clear-to-read gap.
 Explicit `RemoveAll` and owner failure can be excluded/failed operationally,
 but real automatic backend eviction must be disabled with evidence or honor

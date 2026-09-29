@@ -48,6 +48,7 @@ void DiagnosticBackendRead(const std::string& scoped_key,
         const auto identity = mooncake::TenantId::ParseScopedKey(scoped_key);
         sd::Event event{sd::Kind::BackendRead};
         event.tier=sd::Tier::LocalDisk; event.backend=backend;
+        event.purpose=sd::ReadPurposeScope::Current();
         event.physical_file=file; event.offset=offset;
         event.requested_bytes=expected; event.returned_bytes=actual;
         event.error=error;

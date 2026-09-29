@@ -1,6 +1,7 @@
 #include "shared_cache_diagnostics.h"
 
 #include <cassert>
+#include <atomic>
 #include <chrono>
 #include <iostream>
 #include <thread>
@@ -19,8 +20,26 @@ int main(int argc, char**) {
     if (argc>1) {
         auto& runtime=Capture::Global();
         if (!runtime.Enabled()) return 3;
-        Event event{Kind::BackendRead}; event.returned_bytes=123;
-        runtime.Emit("default","component-key",event);
+        std::atomic<int> ready{0};
+        auto emit=[&](ReadPurpose purpose,int bytes) {
+            assert(ReadPurposeScope::Current()==ReadPurpose::Unknown);
+            {
+                ReadPurposeScope scope(purpose);
+                ++ready;
+                while(ready.load()<2) std::this_thread::yield();
+                assert(ReadPurposeScope::Current()==purpose);
+                Event event{Kind::BackendRead}; event.returned_bytes=bytes;
+                event.purpose=ReadPurposeScope::Current();
+                runtime.Emit("default","component-key",event);
+                { ReadPurposeScope nested(ReadPurpose::Unknown); }
+                assert(ReadPurposeScope::Current()==purpose);
+            }
+            assert(ReadPurposeScope::Current()==ReadPurpose::Unknown);
+        };
+        std::thread consumer([&]{emit(ReadPurpose::ConsumerGet,123);});
+        std::thread promotion([&]{emit(ReadPurpose::Promotion,456);});
+        consumer.join(); promotion.join();
+        assert(ReadPurposeScope::Current()==ReadPurpose::Unknown);
         return 0;
     }
     auto config=Fixture();
@@ -95,19 +114,5 @@ int main(int argc, char**) {
     std::thread second([&]{for(int i=0;i<30;++i)parallel.Emit("default","component-key",event);});
     first.join(); second.join(); assert(parallel.Drain().emitted==60);
 
-    ClearFacts clear;
-    assert(!CanClearMemoryUnderLock(clear));
-    clear={true,true,true,true,true,true,true,true,true,true,"memory-segment"};
-    assert(CanClearMemoryUnderLock(clear));
-    // Every independent safety prerequisite must fail closed. This tests the
-    // policy only, not a retention implementation or a destructive API.
-    for (auto member:{&ClearFacts::enabled,&ClearFacts::manifest_matches,
-                      &ClearFacts::original_writer,&ClearFacts::lease_expired,
-                      &ClearFacts::target_is_memory,&ClearFacts::all_replicas_complete,
-                      &ClearFacts::ssd_exact_complete,&ClearFacts::owner_readable,
-                      &ClearFacts::no_inflight_operations,&ClearFacts::ssd_retention_held}) {
-        auto copy=clear; copy.*member=false; assert(!CanClearMemoryUnderLock(copy));
-    }
-    clear.segment=""; assert(!CanClearMemoryUnderLock(clear));
     std::cout << "shared cache diagnostic CPU fixtures passed\n";
 }

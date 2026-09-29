@@ -25,7 +25,8 @@ with tempfile.TemporaryDirectory() as directory:
     result = subprocess.run([binary, "--runtime"], env=env, capture_output=True, check=True)
     data = output.read_text()
     records = [json.loads(line) for line in data.splitlines()]
-    assert len(records) == 2 and records[0]["returned_bytes"] == 123
+    assert len(records) == 3
+    assert {(r["read_purpose"], r["returned_bytes"]) for r in records[:-1]} == {("consumer_get", 123), ("promotion", 456)}
     assert records[-1]["kind"] == "capture_summary" and records[-1]["complete"]
     assert output.stat().st_mode & 0o777 == 0o600
     assert "component-key" not in data and config["key_salt"] not in data

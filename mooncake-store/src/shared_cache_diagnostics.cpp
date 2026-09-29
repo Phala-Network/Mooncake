@@ -23,6 +23,7 @@ namespace mooncake::shared_cache_diagnostics {
 namespace {
 using Clock = std::chrono::steady_clock;
 constexpr uint64_t kSummaryReserve = 1024;
+thread_local ReadPurpose read_purpose=ReadPurpose::Unknown;
 bool Label(const std::string& s) {
     if (s.empty() || s.size() > 96) return false;
     for (unsigned char c : s)
@@ -131,6 +132,14 @@ struct Capture::Impl {
     }
 };
 
+ReadPurposeScope::ReadPurposeScope(ReadPurpose value) noexcept {
+    if (Capture::Global().Enabled()) {
+        active_=true; previous_=read_purpose; read_purpose=value;
+    }
+}
+ReadPurposeScope::~ReadPurposeScope() { if(active_) read_purpose=previous_; }
+ReadPurpose ReadPurposeScope::Current() noexcept { return read_purpose; }
+
 Capture::Capture() = default;
 Capture::Capture(Config c) : impl_(std::make_unique<Impl>(std::move(c))) {}
 Capture::~Capture() = default;
@@ -180,6 +189,7 @@ void Capture::Emit(const std::string& tenant, const std::string& key,
         v["rank"] = s.config.rank; v["component"] = s.config.component;
         v["pid"] = Json::Int64(getpid());
         v["key_id"] = id; v["kind"] = Name(event.kind); v["tier"] = Name(event.tier);
+        v["read_purpose"] = event.purpose==ReadPurpose::ConsumerGet ? "consumer_get" : event.purpose==ReadPurpose::Promotion ? "promotion" : "unknown";
         v["backend"] = Name(event.backend); v["sequence"] = Json::UInt64(s.emitted + 1);
         v["replica_id"] = Json::UInt64(event.replica);
         v["requested_bytes"] = Json::UInt64(event.requested_bytes);
@@ -207,7 +217,7 @@ Snapshot Capture::Drain() noexcept {
         impl_->queue.clear(); result.emitted = impl_->emitted;
         result.dropped = impl_->dropped; result.rejected = impl_->rejected;
         result.bytes = impl_->bytes; result.complete = !result.dropped;
-    } catch (...) { result.complete = false; }
+    } catch (...) { Lost(); result.complete = false; }
     return result;
 }
 
@@ -281,7 +291,8 @@ Capture& Capture::Global() noexcept {
                 capture.reset();
                 // Fixed message only; parser errors can contain salt/input.
                 const char message[]="Mooncake shared cache diagnostics disabled: invalid manifest/output\n";
-                write(STDERR_FILENO,message,sizeof(message)-1);
+                const auto written=write(STDERR_FILENO,message,sizeof(message)-1);
+                (void)written;
             }
         }
         ~Runtime() { stop=true; if(worker.joinable())worker.join(); if(fd>=0)close(fd); }
@@ -290,10 +301,4 @@ Capture& Capture::Global() noexcept {
     return runtime.capture ? *runtime.capture : runtime.disabled;
 }
 
-bool CanClearMemoryUnderLock(const ClearFacts& f) noexcept {
-    return f.enabled && f.manifest_matches && f.original_writer &&
-           f.lease_expired && f.target_is_memory && !f.segment.empty() &&
-           f.all_replicas_complete && f.ssd_exact_complete && f.owner_readable &&
-           f.no_inflight_operations && f.ssd_retention_held;
-}
 }  // namespace mooncake::shared_cache_diagnostics
