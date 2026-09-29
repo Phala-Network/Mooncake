@@ -144,10 +144,10 @@ FileStorage::GetOwnerDrainSnapshot() const {
 void FileStorage::EmitOwnerDrain() const noexcept {
     if (!owner_state_) return;
     try {
-        auto& capture = shared_cache_diagnostics::Capture::Global();
+        auto& capture = shared_cache_diagnostics::Capture::OwnerGlobal();
         if (capture.OwnerEnabled()) capture.EmitOwner(GetOwnerDrainSnapshot());
     } catch (...) {
-        shared_cache_diagnostics::Capture::Global().Lost();
+        shared_cache_diagnostics::Capture::OwnerGlobal().Lost();
     }
 }
 
@@ -163,9 +163,12 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
           config.local_buffer_size, client ? client->GetProtocol() : "")) {
     try {
-        if (const char* manifest =
-                std::getenv("MOONCAKE_SHARED_CACHE_DIAGNOSTICS_MANIFEST");
-            manifest && *manifest)
+        const char* owner_manifest =
+            std::getenv("MOONCAKE_SHARED_CACHE_OWNER_DRAIN_MANIFEST");
+        const char* event_manifest =
+            std::getenv("MOONCAKE_SHARED_CACHE_DIAGNOSTICS_MANIFEST");
+        if ((owner_manifest && *owner_manifest) ||
+            (event_manifest && *event_manifest))
             owner_state_ = std::make_shared<OwnerState>();
     } catch (...) {
     }

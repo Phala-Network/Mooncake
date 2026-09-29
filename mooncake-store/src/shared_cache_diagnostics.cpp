@@ -298,126 +298,158 @@ Snapshot Capture::Drain() noexcept {
     return result;
 }
 
-Capture& Capture::Global() noexcept {
-    struct Runtime {
-        Capture disabled;
-        std::unique_ptr<Capture> capture;
-        std::thread worker;
-        std::atomic<bool> stop{false};
-        int fd = -1;
-        std::atomic<Capture*> active{nullptr};
-        std::atomic<bool> waiting{false};
-        std::mutex arm_mutex;
-        std::string manifest_path;
-        Runtime() noexcept {
-            try {
-                const char* path =
-                    std::getenv("MOONCAKE_SHARED_CACHE_DIAGNOSTICS_MANIFEST");
-                if (!path || !*path) return;
-                manifest_path = path;
-                Load();
-            } catch (...) {
-            }
+struct Capture::Runtime {
+    Capture disabled;
+    std::unique_ptr<Capture> capture;
+    std::thread worker;
+    std::atomic<bool> stop{false};
+    int fd = -1;
+    std::atomic<Capture*> active{nullptr};
+    std::atomic<bool> waiting{false};
+    std::mutex arm_mutex;
+    std::string manifest_path;
+    explicit Runtime(const char* env_name) noexcept {
+        try {
+            const char* path = std::getenv(env_name);
+            if (!path || !*path) return;
+            manifest_path = path;
+            Load();
+        } catch (...) {
         }
-        void Load() noexcept {
-            const char* path = manifest_path.c_str();
-            int input = -1;
-            try {
-                input =
-                    open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
-                if (input < 0 && errno == ENOENT) {
-                    waiting = true;
-                    return;
-                }
-                waiting = false;
-                struct stat st{};
-                if (input < 0 || fstat(input, &st) || !S_ISREG(st.st_mode) ||
-                    st.st_uid != geteuid() || (st.st_mode & 077) || st.st_size <= 0 || st.st_size > 65536)
-                    throw std::runtime_error("diagnostic manifest rejected");
-                std::string data(static_cast<size_t>(st.st_size), '\0');
-                size_t pos = 0;
-                while (pos < data.size()) {
-                    auto n = read(input, data.data() + pos, data.size() - pos);
-                    if (n < 0 && errno == EINTR) continue;
-                    if (n <= 0) throw std::runtime_error("diagnostic manifest short read");
-                    pos += static_cast<size_t>(n);
-                }
-                close(input); input = -1;
-                Json::Value v; Json::CharReaderBuilder reader; std::string errors;
-                reader["rejectDupKeys"] = true;
-                auto parser = std::unique_ptr<Json::CharReader>(reader.newCharReader());
-                if (!parser->parse(data.data(), data.data() + data.size(), &v, &errors))
-                    throw std::runtime_error("invalid diagnostic manifest JSON");
-                Config c;
-                if (v.isMember("capture_owner_drain") &&
-                    !v["capture_owner_drain"].isBool())
-                    throw std::runtime_error("invalid diagnostic owner mode");
-                c.capture_owner_drain =
-                    v.get("capture_owner_drain", false).asBool();
-                c.case_id=v["case_id"].asString(); c.epoch=v["epoch"].asString();
-                c.tenant_id=v["tenant_id"].asString(); c.key_salt=v["key_salt"].asString();
-                c.rank=v["rank"].asString(); c.component=v["component"].asString();
-                for (const auto& key : v["key_ids"]) c.key_ids.push_back(key.asString());
-                c.max_keys=v["max_keys"].asUInt64(); c.max_events=v["max_events"].asUInt64();
-                c.max_bytes=v["max_bytes"].asUInt64(); c.max_duration_ms=v["max_duration_ms"].asUInt64();
-                c.max_requests=v["max_requests"].asUInt64();
-                capture=std::make_unique<Capture>(c);
-                fd=open(v["output_path"].asCString(), O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);
-                if (fd < 0) throw std::runtime_error("diagnostic output rejected");
-                worker=std::thread([this,c] {
-                  try {
+    }
+    void Load() noexcept {
+        const char* path = manifest_path.c_str();
+        int input = -1;
+        try {
+            input = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+            if (input < 0 && errno == ENOENT) {
+                waiting = true;
+                return;
+            }
+            waiting = false;
+            struct stat st{};
+            if (input < 0 || fstat(input, &st) || !S_ISREG(st.st_mode) ||
+                st.st_uid != geteuid() || (st.st_mode & 077) ||
+                st.st_size <= 0 || st.st_size > 65536)
+                throw std::runtime_error("diagnostic manifest rejected");
+            std::string data(static_cast<size_t>(st.st_size), '\0');
+            size_t pos = 0;
+            while (pos < data.size()) {
+                auto n = read(input, data.data() + pos, data.size() - pos);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0)
+                    throw std::runtime_error("diagnostic manifest short read");
+                pos += static_cast<size_t>(n);
+            }
+            close(input);
+            input = -1;
+            Json::Value v;
+            Json::CharReaderBuilder reader;
+            std::string errors;
+            reader["rejectDupKeys"] = true;
+            auto parser =
+                std::unique_ptr<Json::CharReader>(reader.newCharReader());
+            if (!parser->parse(data.data(), data.data() + data.size(), &v,
+                               &errors))
+                throw std::runtime_error("invalid diagnostic manifest JSON");
+            Config c;
+            if (v.isMember("capture_owner_drain") &&
+                !v["capture_owner_drain"].isBool())
+                throw std::runtime_error("invalid diagnostic owner mode");
+            c.capture_owner_drain =
+                v.get("capture_owner_drain", false).asBool();
+            c.case_id = v["case_id"].asString();
+            c.epoch = v["epoch"].asString();
+            c.tenant_id = v["tenant_id"].asString();
+            c.key_salt = v["key_salt"].asString();
+            c.rank = v["rank"].asString();
+            c.component = v["component"].asString();
+            for (const auto& key : v["key_ids"])
+                c.key_ids.push_back(key.asString());
+            c.max_keys = v["max_keys"].asUInt64();
+            c.max_events = v["max_events"].asUInt64();
+            c.max_bytes = v["max_bytes"].asUInt64();
+            c.max_duration_ms = v["max_duration_ms"].asUInt64();
+            c.max_requests = v["max_requests"].asUInt64();
+            capture = std::make_unique<Capture>(c);
+            fd = open(v["output_path"].asCString(),
+                      O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                      0600);
+            if (fd < 0) throw std::runtime_error("diagnostic output rejected");
+            worker = std::thread([this, c] {
+                try {
                     const auto deadline=Clock::now()+std::chrono::milliseconds(c.max_duration_ms);
                     bool ok=true;
                     while (!stop && Clock::now()<deadline) {
                         auto s=capture->Drain();
-                        for (const auto& line:s.events) ok=WriteAll(fd,line)&&ok;
+                        for (const auto& line : s.events)
+                            ok = WriteAll(fd, line) && ok;
                         std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     }
                     capture->impl_->expired=true;
                     auto s=capture->Drain();
-                    for (const auto& line:s.events) ok=WriteAll(fd,line)&&ok;
+                    for (const auto& line : s.events)
+                        ok = WriteAll(fd, line) && ok;
                     Json::Value summary;
-                    summary["kind"]="capture_summary"; summary["emitted"]=Json::UInt64(s.emitted);
-                    summary["dropped"]=Json::UInt64(s.dropped); summary["rejected"]=Json::UInt64(s.rejected);
-                    summary["complete"]=s.complete&&ok; summary["bytes"]=Json::UInt64(s.bytes);
+                    summary["kind"] = "capture_summary";
+                    summary["emitted"] = Json::UInt64(s.emitted);
+                    summary["dropped"] = Json::UInt64(s.dropped);
+                    summary["rejected"] = Json::UInt64(s.rejected);
+                    summary["complete"] = s.complete && ok;
+                    summary["bytes"] = Json::UInt64(s.bytes);
                     WriteAll(fd,EncodeJson(summary));
-                  } catch (...) {
+                } catch (...) {
                     capture->impl_->expired=true;
                     WriteAll(fd,"{\"kind\":\"capture_summary\",\"complete\":false,\"writer_failed\":true}\n");
-                  }
-                });
-                active.store(capture.get(), std::memory_order_release);
-            } catch (...) {
-                if (input>=0) close(input);
-                if (fd>=0) { close(fd); fd=-1; }
-                capture.reset();
-                waiting = false;
-                // Fixed message only; parser errors can contain salt/input.
-                const char message[]="Mooncake shared cache diagnostics disabled: invalid manifest/output\n";
-                const auto written=write(STDERR_FILENO,message,sizeof(message)-1);
-                (void)written;
+                }
+            });
+            active.store(capture.get(), std::memory_order_release);
+        } catch (...) {
+            if (input >= 0) close(input);
+            if (fd >= 0) {
+                close(fd);
+                fd = -1;
             }
+            capture.reset();
+            waiting = false;
+            // Fixed message only; parser errors can contain salt/input.
+            const char message[] =
+                "Mooncake shared cache diagnostics disabled: invalid "
+                "manifest/output\n";
+            const auto written =
+                write(STDERR_FILENO, message, sizeof(message) - 1);
+            (void)written;
         }
-        Capture& Get() noexcept {
+    }
+    Capture& Get() noexcept {
+        if (auto* current = active.load(std::memory_order_acquire))
+            return *current;
+        if (!waiting.load()) return disabled;
+        try {
+            std::lock_guard<std::mutex> guard(arm_mutex);
             if (auto* current = active.load(std::memory_order_acquire))
                 return *current;
             if (!waiting.load()) return disabled;
-            try {
-                std::lock_guard<std::mutex> guard(arm_mutex);
-                if (auto* current = active.load(std::memory_order_acquire))
-                    return *current;
-                if (!waiting.load()) return disabled;
-                Load();
-                if (auto* current = active.load(std::memory_order_acquire))
-                    return *current;
-            } catch (...) {
-                waiting = false;
-            }
-            return disabled;
+            Load();
+            if (auto* current = active.load(std::memory_order_acquire))
+                return *current;
+        } catch (...) {
+            waiting = false;
         }
-        ~Runtime() { stop=true; if(worker.joinable())worker.join(); if(fd>=0)close(fd); }
-    };
-    static Runtime runtime;
+        return disabled;
+    }
+    ~Runtime() {
+        stop = true;
+        if (worker.joinable()) worker.join();
+        if (fd >= 0) close(fd);
+    }
+};
+Capture& Capture::Global() noexcept {
+    static Runtime runtime("MOONCAKE_SHARED_CACHE_DIAGNOSTICS_MANIFEST");
+    return runtime.Get();
+}
+Capture& Capture::OwnerGlobal() noexcept {
+    static Runtime runtime("MOONCAKE_SHARED_CACHE_OWNER_DRAIN_MANIFEST");
     return runtime.Get();
 }
 

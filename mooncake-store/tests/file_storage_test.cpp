@@ -4,6 +4,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <future>
+#include <fstream>
+#include <sys/stat.h>
+#include <json/json.h>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -897,12 +900,76 @@ class SlowDrainBucketBackend : public BucketStorageBackend {
         return BucketStorageBackend::BatchLoad(slices);
     }
 };
-TEST_F(FileStorageTest, OwnerDrainTracksActualBlockedLoadAndLeasedBuffer) {
+void SealPhaseManifest(const std::string& path, const std::string& output,
+                       bool owner) {
+    namespace sd = shared_cache_diagnostics;
+    sd::Config config;
+    config.case_id = "case1";
+    config.epoch = "epoch1";
+    config.tenant_id = "default";
+    config.key_salt = "fixture-salt-0123456789";
+    Json::Value v;
+    v["case_id"] = config.case_id;
+    v["epoch"] = config.epoch;
+    v["tenant_id"] = config.tenant_id;
+    v["key_salt"] = config.key_salt;
+    v["rank"] = "0";
+    v["component"] = "phase-fixture";
+    v["key_ids"].append(sd::Identifier(config, "phala.shared-cache-key.v1",
+                                       "default", "owner-key"));
+    v["max_keys"] = 1;
+    v["max_events"] = 64;
+    v["max_bytes"] = 65536;
+    v["max_duration_ms"] = owner ? 400 : 2000;
+    v["max_requests"] = 1;
+    v["capture_owner_drain"] = owner;
+    v["output_path"] = output;
+    const auto temporary = path + ".sealed";
+    {
+        std::ofstream stream(temporary);
+        stream << v;
+    }
+    ASSERT_EQ(chmod(temporary.c_str(), 0600), 0);
+    fs::rename(temporary, path);
+}
+std::vector<Json::Value> WaitPhaseSummary(const std::string& path) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+        std::ifstream stream(path);
+        std::string line;
+        std::vector<Json::Value> rows;
+        while (std::getline(stream, line)) {
+            Json::Value row;
+            Json::CharReaderBuilder builder;
+            std::string error;
+            auto parser =
+                std::unique_ptr<Json::CharReader>(builder.newCharReader());
+            if (!parser->parse(line.data(), line.data() + line.size(), &row,
+                               &error))
+                break;
+            rows.push_back(row);
+        }
+        if (!rows.empty() && rows.back()["kind"] == "capture_summary")
+            return rows;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return {};
+}
+TEST_F(FileStorageTest,
+       OwnerDrainThenLateReadPreservesIndependentCompleteCaptures) {
     SetEnv("MOONCAKE_SHARED_CACHE_DIAGNOSTICS_MANIFEST",
            data_path + "/absent-sealed-manifest.json");
+    SetEnv("MOONCAKE_SHARED_CACHE_OWNER_DRAIN_MANIFEST",
+           data_path + "/owner-manifest.json");
     struct ResetEnv {
-        ~ResetEnv() { UnsetEnv("MOONCAKE_SHARED_CACHE_DIAGNOSTICS_MANIFEST"); }
+        ~ResetEnv() {
+            UnsetEnv("MOONCAKE_SHARED_CACHE_DIAGNOSTICS_MANIFEST");
+            UnsetEnv("MOONCAKE_SHARED_CACHE_OWNER_DRAIN_MANIFEST");
+        }
     } reset;
+    ASSERT_FALSE(shared_cache_diagnostics::Capture::Global().Enabled());
+    ASSERT_FALSE(shared_cache_diagnostics::Capture::OwnerGlobal().Enabled());
     fs::create_directories(data_path + "/owner-master");
     testing::InProcMaster master;
     auto master_config = InProcMasterConfigBuilder()
@@ -939,6 +1006,26 @@ TEST_F(FileStorageTest, OwnerDrainTracksActualBlockedLoadAndLeasedBuffer) {
         {"owner-key", {{payload.data(), payload.size()}}}};
     ASSERT_TRUE(backend->BatchOffload(
         values, [](const auto&, auto&) { return ErrorCode::OK; }));
+    const auto owner_output = data_path + "/owner-evidence.jsonl";
+    const auto event_output = data_path + "/read-evidence.jsonl";
+    SealPhaseManifest(data_path + "/owner-manifest.json", owner_output, true);
+    ASSERT_TRUE(FileStorageHeartbeat(storage));
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    ASSERT_TRUE(FileStorageHeartbeat(storage));
+    auto owner_rows = WaitPhaseSummary(owner_output);
+    ASSERT_GE(owner_rows.size(), 3);
+    ASSERT_TRUE(owner_rows.back()["complete"].asBool());
+    ASSERT_EQ(owner_rows.back()["dropped"].asUInt64(), 0);
+    EXPECT_FALSE(shared_cache_diagnostics::Capture::OwnerGlobal().Enabled());
+    EXPECT_FALSE(shared_cache_diagnostics::Capture::Global().Enabled());
+    for (size_t i = 0; i + 1 < owner_rows.size(); ++i) {
+        EXPECT_EQ(owner_rows[i]["kind"].asString(), "owner_drain");
+        EXPECT_TRUE(owner_rows[i]["available"].asBool());
+    }
+    // The finite pre-clear owner evidence is complete. Arm a distinct,
+    // previously absent capture for the subsequent actual backend read.
+    SealPhaseManifest(data_path + "/absent-sealed-manifest.json", event_output,
+                      false);
     auto load = std::async(std::launch::async, [&] {
         return storage.BatchGet({"owner-key"}, {512});
     });
@@ -976,5 +1063,31 @@ TEST_F(FileStorageTest, OwnerDrainTracksActualBlockedLoadAndLeasedBuffer) {
     EXPECT_EQ(drained.read_guards, 0);
     EXPECT_EQ(drained.instance, initial.instance);
     EXPECT_GT(drained.activity_sequence, blocked.activity_sequence);
+    auto event_rows = WaitPhaseSummary(event_output);
+    ASSERT_GE(event_rows.size(), 2);
+    EXPECT_TRUE(event_rows.back()["complete"].asBool());
+    EXPECT_EQ(event_rows.back()["dropped"].asUInt64(), 0);
+    bool actual_read = false;
+    for (size_t i = 0; i + 1 < event_rows.size(); ++i) {
+        EXPECT_NE(event_rows[i]["kind"].asString(), "owner_drain");
+        if (event_rows[i]["kind"] == "backend_read_return") {
+            actual_read = true;
+            EXPECT_EQ(event_rows[i]["returned_bytes"].asInt64(), 512);
+            EXPECT_EQ(event_rows[i]["read_purpose"].asString(), "consumer_get");
+            EXPECT_EQ(event_rows[i]["case_id"], owner_rows[0]["case_id"]);
+            EXPECT_EQ(event_rows[i]["epoch"], owner_rows[0]["epoch"]);
+        }
+    }
+    EXPECT_TRUE(actual_read);
+    EXPECT_FALSE(shared_cache_diagnostics::Capture::OwnerGlobal().Enabled());
+    EXPECT_FALSE(shared_cache_diagnostics::Capture::Global().Enabled());
+    SealPhaseManifest(data_path + "/owner-manifest.json",
+                      data_path + "/must-not-rearm-owner.jsonl", true);
+    SealPhaseManifest(data_path + "/absent-sealed-manifest.json",
+                      data_path + "/must-not-rearm-read.jsonl", false);
+    EXPECT_FALSE(shared_cache_diagnostics::Capture::OwnerGlobal().Enabled());
+    EXPECT_FALSE(shared_cache_diagnostics::Capture::Global().Enabled());
+    EXPECT_FALSE(fs::exists(data_path + "/must-not-rearm-owner.jsonl"));
+    EXPECT_FALSE(fs::exists(data_path + "/must-not-rearm-read.jsonl"));
 }
 }  // namespace mooncake

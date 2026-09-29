@@ -114,8 +114,10 @@ class Capture {
               const Event&) noexcept;
     Snapshot Drain() noexcept;
     static Capture& Global() noexcept;
+    static Capture& OwnerGlobal() noexcept;
 
- private:
+   private:
+    struct Runtime;
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
