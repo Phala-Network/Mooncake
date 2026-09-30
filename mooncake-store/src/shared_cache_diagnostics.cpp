@@ -122,8 +122,8 @@ struct Capture::Impl {
             config.key_ids.empty() || config.key_ids.size() > config.max_keys ||
             !config.max_events || config.max_events > 8192 ||
             config.max_bytes < 4096 || config.max_bytes > 16 * 1024 * 1024 ||
-            !config.max_duration_ms || config.max_duration_ms > 120000 ||
-            config.max_requests != 1 || !config.queue_capacity || config.queue_capacity > 1024)
+            !config.max_duration_ms || config.max_duration_ms > 900000 ||
+            !config.max_requests || config.max_requests > 64 || !config.queue_capacity || config.queue_capacity > 1024)
             throw std::invalid_argument("invalid bounded diagnostic manifest");
         for (const auto& id : config.key_ids)
             if (!Hex(id) || !allowed.insert(id).second)
@@ -236,7 +236,7 @@ bool Capture::BeginReadKeys(const std::string& tenant, const std::vector<std::st
             if (!s.allowed.count(id)) continue;
             matched=true;
             // Several component batches belong to one engine request. Only
-            // repeated reads of the same allowlisted object are ambiguous.
+            // repeated reads of each allowlisted object consume its bounded budget.
             if (++s.reads[id]>s.config.max_requests) ++s.dropped;
         }
         return matched;
@@ -265,6 +265,9 @@ void Capture::Emit(const std::string& tenant, const std::string& key,
         v["case_id"] = s.config.case_id; v["epoch"] = s.config.epoch;
         v["rank"] = s.config.rank; v["component"] = s.config.component;
         v["pid"] = Json::Int64(getpid());
+        v["sample_time_unix_ms"] = Json::UInt64(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
         v["key_id"] = id; v["kind"] = Name(event.kind); v["tier"] = Name(event.tier);
         v["read_purpose"] = event.purpose==ReadPurpose::ConsumerGet ? "consumer_get" : event.purpose==ReadPurpose::Promotion ? "promotion" : "unknown";
         v["backend"] = Name(event.backend); v["sequence"] = Json::UInt64(s.emitted + 1);

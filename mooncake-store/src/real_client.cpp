@@ -68,7 +68,7 @@ constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
 
 namespace scd = shared_cache_diagnostics;
 // Native batches are components, not user requests. Multiple disjoint pool
-// batches are accepted; repeated allowlisted keys make this epoch incomplete.
+// batches are accepted; each allowlisted key has a bounded repeated-read budget.
 class SharedCacheReadTrace {
  public:
     SharedCacheReadTrace(const std::vector<std::string>& keys,

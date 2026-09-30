@@ -1,6 +1,9 @@
 #include "shared_cache_diagnostics.h"
 
 #include <cassert>
+#include <json/json.h>
+#include <sstream>
+#include <stdexcept>
 #include <atomic>
 #include <chrono>
 #include <iostream>
@@ -131,6 +134,51 @@ int main(int argc, char** argv) {
     assert(pools.Drain().complete);
     assert(pools.BeginReadKeys("default",{"component-key"}));
     assert(!pools.Drain().complete);
+    // Ordinary serial cases share one capture; the budget remains per key.
+    auto repeated_config = multipool;
+    repeated_config.max_requests = 15;
+    repeated_config.max_duration_ms = 900000;
+    Capture repeated(repeated_config);
+    const auto unix_ms = [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    };
+    const auto before = unix_ms();
+    for (uint64_t i = 1; i <= 15; ++i) {
+        assert(repeated.BeginReadKeys("default", {"component-key"}));
+        repeated.Emit("default", "component-key", event);
+        auto output = repeated.Drain();
+        assert(output.complete && output.events.size() == 1);
+        Json::Value parsed;
+        std::istringstream input(output.events[0]);
+        input >> parsed;
+        assert(parsed["sequence"].asUInt64() == i);
+        assert(parsed["sample_time_unix_ms"].asInt64() >= before);
+        assert(parsed["sample_time_unix_ms"].asInt64() <= unix_ms());
+    }
+    assert(repeated.BeginReadKeys("default", {"second-pool"}));
+    assert(repeated.Drain().complete);
+    assert(repeated.BeginReadKeys("default", {"component-key"}));
+    auto overflow = repeated.Drain();
+    assert(!overflow.complete && overflow.dropped == 1);
+    auto maximum = config;
+    maximum.max_requests = 64;
+    Capture maximum_capture(maximum);
+    assert(maximum_capture.Enabled());
+    for (uint64_t invalid : {0, 65}) {
+        auto bad = config;
+        bad.max_requests = invalid;
+        bool rejected = false;
+        try { Capture invalid_capture(bad); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        assert(rejected);
+    }
+    auto bad_duration = config;
+    bad_duration.max_duration_ms = 900001;
+    bool rejected_duration = false;
+    try { Capture invalid_capture(bad_duration); }
+    catch (const std::invalid_argument&) { rejected_duration = true; }
+    assert(rejected_duration);
     Capture capture(config);
     assert(capture.BeginReadKeys("default",{"component-key"}));
     capture.Emit("other","component-key",event);
