@@ -3147,15 +3147,6 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"))
         .def(
-            "batch_memory_replica_clear",
-            [](MooncakeStorePyWrapper &self, const std::vector<std::string> &keys) {
-                if (!self.is_client_initialized()) return std::vector<std::string>{};
-                py::gil_scoped_release release;
-                return self.store_->batch_memory_replica_clear(keys);
-            }, py::arg("keys"),
-            "Clear only MEMORY replicas using the original writer; requires "
-            "expired leases and complete retained local SSD replicas.")
-        .def(
             "batch_replica_clear",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,

@@ -1,5 +1,4 @@
 #pragma once
-#include "shared_cache_diagnostics.h"
 
 #include <algorithm>
 #include <array>
@@ -405,10 +404,6 @@ class MasterService {
                            const std::string& segment_name)
         -> tl::expected<std::vector<std::string>, ErrorCode>;
 
-    auto BatchMemoryReplicaClear(const std::vector<std::string>& object_keys,
-                                 const UUID& client_id, const std::string& tenant_id)
-        -> tl::expected<std::vector<std::string>, ErrorCode>;
-
     // New: tenant-aware overload
     auto BatchReplicaClear(const std::vector<std::string>& object_keys,
                            const UUID& client_id,
@@ -416,12 +411,6 @@ class MasterService {
                            const std::string& tenant_id)
         -> tl::expected<std::vector<std::string>, ErrorCode>;
 
-   private:
-    auto BatchReplicaClearImpl(const std::vector<std::string>& object_keys,
-                               const UUID& client_id, const std::string& segment_name,
-                               const std::string& tenant_id, bool memory_only)
-        -> tl::expected<std::vector<std::string>, ErrorCode>;
-   public:
     /**
      * @brief Retrieves replica lists for object keys that match a regex
      * pattern.
@@ -468,10 +457,6 @@ class MasterService {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                                 const TenantId& tenant_id);
-    // Finite read-only diagnostic projection; no query/lease/promotion side
-    // effects.
-    std::optional<std::string> GetFiniteSnapshotForAdmin(
-        const shared_cache_diagnostics::SnapshotRequest& request);
 
     /**
      * @brief Start a put operation for an object

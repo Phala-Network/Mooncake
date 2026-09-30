@@ -21,9 +21,6 @@ namespace mooncake {
 class HttpMetadataServer;
 class WrappedMasterService {
    public:
-    tl::expected<std::vector<std::string>, ErrorCode> BatchMemoryReplicaClear(
-        const std::vector<std::string>& keys, const UUID& client_id, const std::string& tenant_id);
-
     // Constructor with optional metadata-cleanup-on-timeout configuration.
     // - http_metadata_server: in-process pointer used when the HTTP metadata
     //   server is co-located in the master process (nullptr = not co-located).
@@ -55,16 +52,6 @@ class WrappedMasterService {
     tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
         const std::vector<std::string>& object_keys, const UUID& client_id,
         const std::string& segment_name);
-
-    // Backward-compatible internal dispatch for non-default clients. Never
-    // falls back to the legacy default-tenant RPC on an old master.
-    tl::expected<std::vector<std::string>, ErrorCode>
-    BatchReplicaClearForTenant(const std::vector<std::string>& object_keys,
-                               const UUID& client_id,
-                               const std::string& segment_name,
-                               const std::string& tenant_id);
-    std::optional<std::string> GetFiniteSnapshotForAdmin(
-        const shared_cache_diagnostics::SnapshotRequest& request);
 
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,

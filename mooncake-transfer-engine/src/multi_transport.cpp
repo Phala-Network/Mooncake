@@ -407,21 +407,6 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     return Status::OK();
 }
 
-Status MultiTransport::getBatchTransportSelection(
-    BatchID batch_id, Transport::BatchTransportSelection& selection) {
-    const auto& batch = *reinterpret_cast<const BatchDesc*>(batch_id);
-    selection = {};
-    selection.task_count = batch.task_list.size();
-    for (const auto& task : batch.task_list) {
-        if (!task.transport_) {
-            ++selection.missing_transports;
-            continue;
-        }
-        ++selection.selected_transports[task.transport_->getName()];
-    }
-    return Status::OK();
-}
-
 Transport* MultiTransport::installTransport(const std::string& proto,
                                             std::shared_ptr<Topology> topo) {
 #ifdef USE_NCCL_HOST

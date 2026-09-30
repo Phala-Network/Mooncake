@@ -227,9 +227,6 @@ class TransferEngine {
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
-    Status getBatchTransportSelection(
-        BatchID batch_id, Transport::BatchTransportSelection& selection);
-
     Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
     Transport* getTransport(const std::string& proto);

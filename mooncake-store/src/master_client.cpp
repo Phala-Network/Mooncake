@@ -48,16 +48,6 @@ struct RpcNameTraits<&WrappedMasterService::BatchQueryIp> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::BatchReplicaClearForTenant> {
-    static constexpr const char* value = "BatchReplicaClearForTenant";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::BatchMemoryReplicaClear> {
-    static constexpr const char* value = "BatchMemoryReplicaClear";
-};
-
-template <>
 struct RpcNameTraits<&WrappedMasterService::BatchReplicaClear> {
     static constexpr const char* value = "BatchReplicaClear";
 };
@@ -520,27 +510,17 @@ MasterClient::BatchQueryIp(const std::vector<UUID>& client_ids) {
 }
 
 tl::expected<std::vector<std::string>, ErrorCode>
-MasterClient::BatchMemoryReplicaClear(
-    const std::vector<std::string>& keys, const UUID& client_id) {
-    return invoke_rpc<&WrappedMasterService::BatchMemoryReplicaClear,
-                      std::vector<std::string>>(keys, client_id, tenant_id_.value());
-}
-
-tl::expected<std::vector<std::string>, ErrorCode>
 MasterClient::BatchReplicaClear(const std::vector<std::string>& object_keys,
                                 const UUID& client_id,
                                 const std::string& segment_name) {
     ScopedVLogTimer timer(1, "MasterClient::BatchReplicaClear");
-    timer.LogRequest("object_keys_count=", object_keys.size());
-    auto result =
-        tenant_id_ == TenantId::Default()
-            ? invoke_rpc<&WrappedMasterService::BatchReplicaClear,
-                         std::vector<std::string>>(object_keys, client_id,
-                                                   segment_name)
-            : invoke_rpc<&WrappedMasterService::BatchReplicaClearForTenant,
-                         std::vector<std::string>>(
-                  object_keys, client_id, segment_name, tenant_id_.value());
-    timer.LogResponse("success=", result.has_value());
+    timer.LogRequest("object_keys_count=", object_keys.size(),
+                     ", client_id=", client_id,
+                     ", segment_name=", segment_name);
+    auto result = invoke_rpc<&WrappedMasterService::BatchReplicaClear,
+                             std::vector<std::string>>(object_keys, client_id,
+                                                       segment_name);
+    timer.LogResponseExpected(result);
     return result;
 }
 

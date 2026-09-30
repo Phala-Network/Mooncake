@@ -389,12 +389,6 @@ class TransferEngineImpl {
     device::NcclTransport* getOrCreateNcclTransport();
 #endif
 
-    Status getBatchTransportSelection(
-        BatchID batch_id, Transport::BatchTransportSelection& selection) {
-        return multi_transports_->getBatchTransportSelection(batch_id,
-                                                             selection);
-    }
-
     bool isTcpOnly() const { return multi_transports_->isTcpOnly(); }
 
     int syncSegmentCache(const std::string& segment_name = "") {

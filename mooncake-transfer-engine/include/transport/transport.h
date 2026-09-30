@@ -30,7 +30,6 @@
 #include <functional>
 #include <mutex>
 #include <condition_variable>
-#include <map>
 
 #include "common/base/status.h"
 #include "transfer_metadata.h"
@@ -48,12 +47,6 @@ class Transport {
     friend class MultiTransport;
 
    public:
-    struct BatchTransportSelection {
-        size_t task_count = 0;
-        size_t missing_transports = 0;
-        std::map<std::string, size_t> selected_transports;
-    };
-
     using SegmentID = uint64_t;
     using SegmentHandle = SegmentID;
 

@@ -4,7 +4,6 @@
 #include "client_buffer.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
-#include "shared_cache_diagnostics.h"
 
 namespace mooncake {
 
@@ -91,20 +90,11 @@ class FileStorage {
      * @return true if batch was found and released, false otherwise
      */
     bool ReleaseBuffer(uint64_t batch_id);
-    shared_cache_diagnostics::OwnerDrainSnapshot GetOwnerDrainSnapshot() const;
 
    private:
     friend class FileStorageTest;
     friend class FileStoragePromotionTest;
-    friend class FileStorageOwnerDrainTest;
-    struct OwnerState;
-    struct OwnerLease;
-    class OwnerScope;
-    std::shared_ptr<OwnerState> owner_state_;
-    void EmitOwnerDrain() const noexcept;
-    tl::expected<void, ErrorCode> HeartbeatImpl();
     struct AllocatedBatch {
-        std::shared_ptr<void> diagnostic_owner_lease;
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
         std::unordered_map<std::string, Slice> slices;

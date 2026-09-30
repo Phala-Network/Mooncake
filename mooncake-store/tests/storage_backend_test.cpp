@@ -1,4 +1,3 @@
-#include "shared_cache_diagnostics.h"
 #include "storage_backend.h"
 
 #include <glog/logging.h>
@@ -5130,9 +5129,3 @@ TEST_F(StorageBackendTest, BucketBatchLoadRejectsShortRead) {
 #endif
 
 }  // namespace mooncake::test
-
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    (void)mooncake::shared_cache_diagnostics::Capture::Global();
-    return RUN_ALL_TESTS();
-}

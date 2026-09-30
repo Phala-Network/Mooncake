@@ -204,35 +204,6 @@ class MasterServiceTest : public ::testing::Test {
         return std::nullopt;
     }
 
-    void InvalidateEndpointForTest(MasterService& service, const std::string& endpoint) {
-        std::unique_lock<std::shared_mutex> lock(service.snapshot_mutex_);
-        service.invalid_replica_endpoints_.insert(endpoint);
-    }
-
-    void MoveCompletedMemoryForTest(MasterService& service,
-                                    const std::string& from, const std::string& to) {
-        std::vector<Replica> memory;
-        {
-            MasterService::MetadataAccessorRW source(
-                &service, service.MakeObjectIdentityForRequest(from, TenantId::Default()));
-            ASSERT_TRUE(source.Exists());
-            memory = source.Get().PopReplicas(&Replica::fn_is_memory_replica);
-        }
-        ASSERT_FALSE(memory.empty());
-        MasterService::MetadataAccessorRW target(
-            &service, service.MakeObjectIdentityForRequest(to, TenantId::Default()));
-        ASSERT_TRUE(target.Exists());
-        target.Get().AddReplicas(std::move(memory));
-    }
-
-    void SetMemoryBusyForTest(MasterService& service, const std::string& key, bool busy) {
-        MasterService::MetadataAccessorRW accessor(
-            &service, service.MakeObjectIdentityForRequest(key, TenantId::Default()));
-        ASSERT_TRUE(accessor.Exists());
-        accessor.Get().VisitReplicas(&Replica::fn_is_memory_replica,
-            [busy](Replica& r) { if (busy) r.inc_refcnt(); else r.dec_refcnt(); });
-    }
-
     void UpsertSoftPinDeadlineIndexForTest(
         MasterService& service, const std::string& key, size_t shard_idx,
         const std::chrono::system_clock::time_point& deadline,
@@ -6500,93 +6471,6 @@ TEST_F(MasterServiceTest, OffloadObjectHeartbeat) {
         ASSERT_TRUE(it != res->end());
         ASSERT_EQ(it->size, 1024);
     }
-}
-
-TEST_F(MasterServiceTest, BatchMemoryReplicaClearPreservesSameSegmentSSDAndRepeats) {
-    MasterService service(MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(100).build());
-    const auto writer = generate_uuid();
-    auto segment = MakeSegment("shared-endpoint");
-    ASSERT_TRUE(service.MountSegment(segment, writer).has_value());
-    auto second = MakeSegment("second-memory", 0x400000000);
-    ASSERT_TRUE(service.MountSegment(second, writer).has_value());
-    ReplicateConfig config;
-    config.replica_num = 2;
-    ASSERT_TRUE(service.PutStart(writer, "ready", TenantId::Default(), 1024, config).has_value());
-    ASSERT_TRUE(service.PutEnd(writer, "ready", TenantId::Default(), ReplicaType::MEMORY).has_value());
-    Replica disk(writer, 1024, segment.name, ReplicaStatus::COMPLETE);
-    ASSERT_TRUE(service.AddReplica(writer, "ready", TenantId::Default(), disk).has_value());
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    auto before = service.GetReplicaListForAdmin("ready", TenantId::Default());
-    ASSERT_TRUE(before.has_value());
-    ASSERT_EQ(before->replicas.size(), 3u);
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        if (attempt == 2) {
-            // Simulate completed promotion with real allocated MEMORY replicas;
-            // this is not an SSD I/O test. The retained disk descriptor stays put.
-            ASSERT_TRUE(service.PutStart(writer, "promotion-buffer", TenantId::Default(), 1024, config).has_value());
-            ASSERT_TRUE(service.PutEnd(writer, "promotion-buffer", TenantId::Default(), ReplicaType::MEMORY).has_value());
-            MoveCompletedMemoryForTest(service, "promotion-buffer", "ready");
-            auto promoted = service.GetReplicaListForAdmin("ready", TenantId::Default());
-            ASSERT_TRUE(promoted.has_value());
-            ASSERT_EQ(promoted->replicas.size(), 3u);
-            SetMemoryBusyForTest(service, "ready", true);
-            auto busy = service.BatchMemoryReplicaClear({"ready"}, writer, "default");
-            ASSERT_TRUE(busy.has_value());
-            EXPECT_TRUE(busy->empty());
-            SetMemoryBusyForTest(service, "ready", false);
-        }
-        auto result = service.BatchMemoryReplicaClear({"ready"}, writer, "default");
-        ASSERT_TRUE(result.has_value());
-        EXPECT_EQ(result.value(), std::vector<std::string>{"ready"});
-        auto after = service.GetReplicaListForAdmin("ready", TenantId::Default());
-        ASSERT_TRUE(after.has_value());
-        ASSERT_EQ(after->replicas.size(), 1u);
-        EXPECT_TRUE(after->replicas[0].is_local_disk_replica());
-        EXPECT_EQ(after->replicas[0].get_local_disk_descriptor().transport_endpoint, segment.name);
-        EXPECT_EQ(after->replicas[0].get_local_disk_descriptor().object_size, 1024u);
-    }
-}
-
-TEST_F(MasterServiceTest, BatchMemoryReplicaClearPartialAndSafetyGates) {
-    MasterService service(MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(10000).build());
-    const auto writer = generate_uuid();
-    const auto other = generate_uuid();
-    auto segment = MakeSegment("memory");
-    ASSERT_TRUE(service.MountSegment(segment, writer).has_value());
-    ReplicateConfig config;
-    config.replica_num = 1;
-    const std::vector<std::string> keys = {"ready", "no-ssd", "incomplete", "bad-ssd", "foreign", "leased", "invalid-ssd"};
-    for (const auto& key : keys) {
-        const auto owner = key == "foreign" ? other : writer;
-        ASSERT_TRUE(service.PutStart(owner, key, TenantId::Default(), 1024, config).has_value());
-        if (key != "incomplete") {
-            ASSERT_TRUE(service.PutEnd(owner, key, TenantId::Default(), ReplicaType::MEMORY).has_value());
-        }
-        if (key != "no-ssd") {
-            Replica disk(owner, 1024, key == "invalid-ssd" ? "dead-ssd" : "ssd", key == "bad-ssd" ? ReplicaStatus::PROCESSING : ReplicaStatus::COMPLETE);
-            ASSERT_TRUE(service.AddReplica(owner, key, TenantId::Default(), disk).has_value());
-        }
-    }
-    InvalidateEndpointForTest(service, "dead-ssd");
-    ASSERT_TRUE(service.GetReplicaList("leased", TenantId::Default()).has_value());
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    auto result = service.BatchMemoryReplicaClear(keys, writer, "default");
-    ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(result.value(), std::vector<std::string>{"ready"});
-    for (const auto& key : {"no-ssd", "foreign", "leased", "invalid-ssd"}) {
-        auto retained = service.GetReplicaListForAdmin(key, TenantId::Default());
-        ASSERT_TRUE(retained.has_value());
-        EXPECT_TRUE(std::any_of(retained->replicas.begin(), retained->replicas.end(),
-                               [](const auto& r) { return r.is_memory_replica(); }));
-    }
-    EXPECT_FALSE(service.BatchMemoryReplicaClear({}, writer, "default").has_value());
-    EXPECT_FALSE(service.BatchMemoryReplicaClear({"ready", "ready"}, writer, "default").has_value());
-    EXPECT_FALSE(service.BatchMemoryReplicaClear({"ready"}, writer, "other-tenant").has_value());
-    auto missing = service.BatchMemoryReplicaClear({"missing"}, writer, "default");
-    ASSERT_TRUE(missing.has_value());
-    EXPECT_TRUE(missing->empty());
 }
 
 TEST_F(MasterServiceTest, BatchReplicaClearAllSegments) {
