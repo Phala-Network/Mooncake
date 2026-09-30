@@ -204,6 +204,30 @@ class MasterServiceTest : public ::testing::Test {
         return std::nullopt;
     }
 
+    void MoveCompletedMemoryForTest(MasterService& service,
+                                    const std::string& from, const std::string& to) {
+        std::vector<Replica> memory;
+        {
+            MasterService::MetadataAccessorRW source(
+                &service, service.MakeObjectIdentityForRequest(from, TenantId::Default()));
+            ASSERT_TRUE(source.Exists());
+            memory = source.Get().PopReplicas(&Replica::fn_is_memory_replica);
+        }
+        ASSERT_FALSE(memory.empty());
+        MasterService::MetadataAccessorRW target(
+            &service, service.MakeObjectIdentityForRequest(to, TenantId::Default()));
+        ASSERT_TRUE(target.Exists());
+        target.Get().AddReplicas(std::move(memory));
+    }
+
+    void SetMemoryBusyForTest(MasterService& service, const std::string& key, bool busy) {
+        MasterService::MetadataAccessorRW accessor(
+            &service, service.MakeObjectIdentityForRequest(key, TenantId::Default()));
+        ASSERT_TRUE(accessor.Exists());
+        accessor.Get().VisitReplicas(&Replica::fn_is_memory_replica,
+            [busy](Replica& r) { if (busy) r.inc_refcnt(); else r.dec_refcnt(); });
+    }
+
     void UpsertSoftPinDeadlineIndexForTest(
         MasterService& service, const std::string& key, size_t shard_idx,
         const std::chrono::system_clock::time_point& deadline,
@@ -6491,7 +6515,22 @@ TEST_F(MasterServiceTest, BatchMemoryReplicaClearPreservesSameSegmentSSDAndRepea
     auto before = service.GetReplicaListForAdmin("ready", TenantId::Default());
     ASSERT_TRUE(before.has_value());
     ASSERT_EQ(before->replicas.size(), 3u);
-    for (int attempt = 0; attempt < 2; ++attempt) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (attempt == 2) {
+            // Simulate completed promotion with real allocated MEMORY replicas;
+            // this is not an SSD I/O test. The retained disk descriptor stays put.
+            ASSERT_TRUE(service.PutStart(writer, "promotion-buffer", TenantId::Default(), 1024, config).has_value());
+            ASSERT_TRUE(service.PutEnd(writer, "promotion-buffer", TenantId::Default(), ReplicaType::MEMORY).has_value());
+            MoveCompletedMemoryForTest(service, "promotion-buffer", "ready");
+            auto promoted = service.GetReplicaListForAdmin("ready", TenantId::Default());
+            ASSERT_TRUE(promoted.has_value());
+            ASSERT_EQ(promoted->replicas.size(), 3u);
+            SetMemoryBusyForTest(service, "ready", true);
+            auto busy = service.BatchMemoryReplicaClear({"ready"}, writer, "default");
+            ASSERT_TRUE(busy.has_value());
+            EXPECT_TRUE(busy->empty());
+            SetMemoryBusyForTest(service, "ready", false);
+        }
         auto result = service.BatchMemoryReplicaClear({"ready"}, writer, "default");
         ASSERT_TRUE(result.has_value());
         EXPECT_EQ(result.value(), std::vector<std::string>{"ready"});
