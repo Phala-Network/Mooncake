@@ -204,6 +204,11 @@ class MasterServiceTest : public ::testing::Test {
         return std::nullopt;
     }
 
+    void InvalidateEndpointForTest(MasterService& service, const std::string& endpoint) {
+        std::unique_lock<std::shared_mutex> lock(service.snapshot_mutex_);
+        service.invalid_replica_endpoints_.insert(endpoint);
+    }
+
     void MoveCompletedMemoryForTest(MasterService& service,
                                     const std::string& from, const std::string& to) {
         std::vector<Replica> memory;
@@ -6552,7 +6557,7 @@ TEST_F(MasterServiceTest, BatchMemoryReplicaClearPartialAndSafetyGates) {
     ASSERT_TRUE(service.MountSegment(segment, writer).has_value());
     ReplicateConfig config;
     config.replica_num = 1;
-    const std::vector<std::string> keys = {"ready", "no-ssd", "incomplete", "bad-ssd", "foreign", "leased"};
+    const std::vector<std::string> keys = {"ready", "no-ssd", "incomplete", "bad-ssd", "foreign", "leased", "invalid-ssd"};
     for (const auto& key : keys) {
         const auto owner = key == "foreign" ? other : writer;
         ASSERT_TRUE(service.PutStart(owner, key, TenantId::Default(), 1024, config).has_value());
@@ -6560,16 +6565,17 @@ TEST_F(MasterServiceTest, BatchMemoryReplicaClearPartialAndSafetyGates) {
             ASSERT_TRUE(service.PutEnd(owner, key, TenantId::Default(), ReplicaType::MEMORY).has_value());
         }
         if (key != "no-ssd") {
-            Replica disk(owner, 1024, "ssd", key == "bad-ssd" ? ReplicaStatus::PROCESSING : ReplicaStatus::COMPLETE);
+            Replica disk(owner, 1024, key == "invalid-ssd" ? "dead-ssd" : "ssd", key == "bad-ssd" ? ReplicaStatus::PROCESSING : ReplicaStatus::COMPLETE);
             ASSERT_TRUE(service.AddReplica(owner, key, TenantId::Default(), disk).has_value());
         }
     }
+    InvalidateEndpointForTest(service, "dead-ssd");
     ASSERT_TRUE(service.GetReplicaList("leased", TenantId::Default()).has_value());
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     auto result = service.BatchMemoryReplicaClear(keys, writer, "default");
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result.value(), std::vector<std::string>{"ready"});
-    for (const auto& key : {"no-ssd", "foreign", "leased"}) {
+    for (const auto& key : {"no-ssd", "foreign", "leased", "invalid-ssd"}) {
         auto retained = service.GetReplicaListForAdmin(key, TenantId::Default());
         ASSERT_TRUE(retained.has_value());
         EXPECT_TRUE(std::any_of(retained->replicas.begin(), retained->replicas.end(),

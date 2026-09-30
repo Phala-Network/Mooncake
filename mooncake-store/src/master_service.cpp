@@ -3393,8 +3393,8 @@ auto MasterService::BatchReplicaClearImpl(
             // Never match by segment name: SSD can share the MEMORY endpoint.
             if (!metadata.AllReplicas(&Replica::fn_is_completed) ||
                 metadata.HasReplica(&Replica::fn_is_busy) ||
-                !metadata.HasReplica([](const Replica& r) {
-                    return r.is_local_disk_replica() && r.is_completed();
+                !metadata.HasReplica([this](const Replica& r) {
+                    return r.is_local_disk_replica() && IsReplicaReadable(r);
                 })) {
                 continue;
             }
