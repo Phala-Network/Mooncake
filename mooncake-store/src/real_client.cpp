@@ -1,3 +1,4 @@
+#include <stdexcept>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -6784,6 +6785,14 @@ std::vector<CachedQueryResultResponse> RealClient::batch_get_query_results(
             to_cached_query_result_response(query_result, now));
     }
     return cached_results;
+}
+
+std::vector<std::string> RealClient::batch_memory_replica_clear(
+    const std::vector<std::string>& keys) {
+    if (!client_) return {};
+    auto result = client_->BatchMemoryReplicaClear(keys);
+    if (!result) throw std::runtime_error("native_memory_clear_rpc_failed");
+    return result.value();
 }
 
 std::vector<std::string> RealClient::batch_replica_clear(

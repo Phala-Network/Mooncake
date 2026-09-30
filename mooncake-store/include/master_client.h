@@ -80,6 +80,9 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
  */
 class MasterClient {
    public:
+    tl::expected<std::vector<std::string>, ErrorCode> BatchMemoryReplicaClear(
+        const std::vector<std::string>& keys, const UUID& client_id);
+
     MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
                  std::string tenant_id = "default")
         : client_accessor_(GetStoreRpcClientIoContextPool(),

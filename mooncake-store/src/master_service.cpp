@@ -3327,10 +3327,34 @@ auto MasterService::BatchReplicaClear(
     const std::vector<std::string>& object_keys, const UUID& client_id,
     const std::string& segment_name, const std::string& tenant_id)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
+    return BatchReplicaClearImpl(object_keys, client_id, segment_name, tenant_id, false);
+}
+
+auto MasterService::BatchMemoryReplicaClear(
+    const std::vector<std::string>& object_keys, const UUID& client_id,
+    const std::string& tenant_id)
+    -> tl::expected<std::vector<std::string>, ErrorCode> {
+    const TenantId tenant(tenant_id);
+    if (!tenant.IsValid() || (tenant != TenantId::Default() && !enable_multi_tenants_)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (object_keys.empty() || object_keys.size() > 256 ||
+        std::unordered_set<std::string>(object_keys.begin(), object_keys.end()).size() != object_keys.size() ||
+        std::any_of(object_keys.begin(), object_keys.end(),
+                    [](const auto& key) { return key.empty() || key.size() > 4096; })) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return BatchReplicaClearImpl(object_keys, client_id, "", tenant_id, true);
+}
+
+auto MasterService::BatchReplicaClearImpl(
+    const std::vector<std::string>& object_keys, const UUID& client_id,
+    const std::string& segment_name, const std::string& tenant_id, bool memory_only)
+    -> tl::expected<std::vector<std::string>, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     std::vector<std::string> cleared_keys;
     cleared_keys.reserve(object_keys.size());
-    const bool clear_all_segments = segment_name.empty();
+    const bool clear_all_segments = segment_name.empty() && !memory_only;
     const TenantId requested_tenant(tenant_id);
     if (!requested_tenant.IsValid()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -3362,6 +3386,24 @@ auto MasterService::BatchReplicaClear(
         if (!metadata.IsLeaseExpired()) {
             LOG(WARNING) << "BatchReplicaClear: active_lease";
             continue;
+        }
+
+        if (memory_only) {
+            // Inspect all current segments under the removal's metadata lock.
+            // Never match by segment name: SSD can share the MEMORY endpoint.
+            if (!metadata.AllReplicas(&Replica::fn_is_completed) ||
+                metadata.HasReplica(&Replica::fn_is_busy) ||
+                !metadata.HasReplica([](const Replica& r) {
+                    return r.is_local_disk_replica() && r.is_completed();
+                })) {
+                continue;
+            }
+            if (!metadata.HasReplica([](const Replica& r) {
+                    return r.is_memory_replica();
+                })) {
+                cleared_keys.emplace_back(key);  // Idempotent completed state.
+                continue;
+            }
         }
 
         if (clear_all_segments) {
@@ -3418,6 +3460,7 @@ auto MasterService::BatchReplicaClear(
                 if (!replica.is_completed()) {
                     return false;
                 }
+                if (memory_only) return replica.is_memory_replica();
                 const auto segment_names = replica.get_segment_names();
                 for (const auto& seg_name : segment_names) {
                     if (seg_name.has_value() &&
@@ -3434,7 +3477,7 @@ auto MasterService::BatchReplicaClear(
             }
 
             bool had_completed_disk_on_segment =
-                metadata.HasReplica([&segment_name](const Replica& r) {
+                !memory_only && metadata.HasReplica([&segment_name](const Replica& r) {
                     if (!r.is_local_disk_replica() || !r.is_completed())
                         return false;
                     for (const auto& name : r.get_segment_names()) {

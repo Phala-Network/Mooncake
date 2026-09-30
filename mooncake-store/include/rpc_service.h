@@ -21,6 +21,9 @@ namespace mooncake {
 class HttpMetadataServer;
 class WrappedMasterService {
    public:
+    tl::expected<std::vector<std::string>, ErrorCode> BatchMemoryReplicaClear(
+        const std::vector<std::string>& keys, const UUID& client_id, const std::string& tenant_id);
+
     // Constructor with optional metadata-cleanup-on-timeout configuration.
     // - http_metadata_server: in-process pointer used when the HTTP metadata
     //   server is co-located in the master process (nullptr = not co-located).

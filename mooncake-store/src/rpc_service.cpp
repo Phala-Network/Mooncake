@@ -195,6 +195,15 @@ WrappedMasterService::BatchQueryIp(const std::vector<UUID>& client_ids) {
 }
 
 tl::expected<std::vector<std::string>, ErrorCode>
+WrappedMasterService::BatchMemoryReplicaClear(
+    const std::vector<std::string>& keys, const UUID& client_id, const std::string& tenant_id) {
+    const TenantId tenant(tenant_id);
+    if (!tenant.IsValid() || (tenant != TenantId::Default() && !master_service_.IsTenantQuotaEnabled()))
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    return master_service_.BatchMemoryReplicaClear(keys, client_id, tenant.value());
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
 WrappedMasterService::BatchReplicaClear(
     const std::vector<std::string>& object_keys, const UUID& client_id,
     const std::string& segment_name) {
@@ -1754,6 +1763,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchMemoryReplicaClear>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchReplicaClear>(
         &wrapped_master_service);

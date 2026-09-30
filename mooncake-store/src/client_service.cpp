@@ -1341,6 +1341,11 @@ tl::expected<void, ErrorCode> Client::VerifyObjectChecksum(
     return {};
 }
 
+tl::expected<std::vector<std::string>, ErrorCode> Client::BatchMemoryReplicaClear(
+    const std::vector<std::string>& keys) {
+    return master_client_.BatchMemoryReplicaClear(keys, getClientId());
+}
+
 tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
     const std::vector<std::string>& object_keys, const UUID& client_id,
     const std::string& segment_name) {

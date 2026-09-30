@@ -71,6 +71,10 @@ class QueryResult {
  */
 class Client {
    public:
+    tl::expected<std::vector<std::string>, ErrorCode> BatchMemoryReplicaClear(
+        const std::vector<std::string>& keys);
+
+
     virtual ~Client();
 
     using WriteBufferStager =

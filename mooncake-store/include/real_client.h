@@ -755,6 +755,9 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys);
     std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
 
+    std::vector<std::string> batch_memory_replica_clear(
+        const std::vector<std::string>& keys) override;
+
     std::vector<std::string> batch_replica_clear(
         const std::vector<std::string> &keys,
         const std::string &segment_name = "") override;

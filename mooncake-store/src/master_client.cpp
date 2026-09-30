@@ -53,6 +53,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchReplicaClearForTenant> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchMemoryReplicaClear> {
+    static constexpr const char* value = "BatchMemoryReplicaClear";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchReplicaClear> {
     static constexpr const char* value = "BatchReplicaClear";
 };
@@ -512,6 +517,13 @@ MasterClient::BatchQueryIp(const std::vector<UUID>& client_ids) {
 
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+MasterClient::BatchMemoryReplicaClear(
+    const std::vector<std::string>& keys, const UUID& client_id) {
+    return invoke_rpc<&WrappedMasterService::BatchMemoryReplicaClear,
+                      std::vector<std::string>>(keys, client_id, tenant_id_.value());
 }
 
 tl::expected<std::vector<std::string>, ErrorCode>
