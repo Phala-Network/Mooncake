@@ -2979,6 +2979,84 @@ TEST(TcpWriteVisibilityTest,
     reclaimBatchDescAfterEngineShutdownForTest(batch_id);
 }
 
+// Backport of upstream 74d26b56, using post1's existing item caps.
+TEST(TcpWriteVisibilityTest, ItemRejectionDoesNotStrandAlreadyAcceptedWork) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "1");
+    ScopedEnvVar pending_capacity("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER", "1");
+    ScopedEnvVar admission_timeout("MC_TCP_ADMISSION_TIMEOUT_MS", "60000");
+    const char* env = std::getenv("MC_METADATA_SERVER");
+    const std::string metadata_server = env ? env : "P2PHANDSHAKE";
+    ReusingWriteServer fake_peer;
+    ASSERT_TRUE(fake_peer.ok());
+    EngineHandle h;
+    h.init(metadata_server, "127.0.0.2:17947", 64 * 1024);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+    ScopedLaneHooks hooks(/*block_first_connect_handler=*/true);
+    const auto request = makeWriteRequest(h, 1);
+    const auto accepted_batch = h.engine->allocateBatchID(1);
+    const auto pending_batch = h.engine->allocateBatchID(1);
+    const auto rejected_batch = h.engine->allocateBatchID(1);
+    const auto recovery_batch = h.engine->allocateBatchID(1);
+
+    // Fill pending before the first pump is posted. Its connect callback then
+    // blocks with both containers full and pump_scheduled cleared.
+    static TransferEngine* submit_engine;
+    static TransferRequest nested_request;
+    static Transport::BatchID nested_batch;
+    static std::atomic<bool> nested_submitted;
+    static std::atomic<bool> nested_ok;
+    submit_engine = h.engine.get();
+    nested_request = request;
+    nested_batch = pending_batch;
+    nested_submitted.store(false);
+    nested_ok.store(false);
+    tcpTransportSetLaneObserverHookForTest(
+        [](int event, size_t depth, uint64_t bytes, size_t sockets,
+           bool current) noexcept {
+            observeLaneState(event, depth, bytes, sockets, current);
+            if (event == kLaneQueueAdmitted && !nested_submitted.exchange(true)) {
+                nested_ok.store(submit_engine->submitTransfer(
+                    nested_batch, {nested_request}).ok());
+            }
+        });
+    ASSERT_TRUE(h.engine->submitTransfer(accepted_batch, {request}).ok());
+    ASSERT_TRUE(nested_submitted.load());
+    ASSERT_TRUE(nested_ok.load());
+    ASSERT_TRUE(waitForPredicate(
+        [] { return lane_connect_handler_entered.load(std::memory_order_acquire); },
+        std::chrono::seconds(5)));
+    ASSERT_TRUE(h.engine->submitTransfer(rejected_batch, {request}).ok());
+    TransferStatus rejected_status;
+    ASSERT_TRUE(h.engine->getTransferStatus(rejected_batch, 0, rejected_status).ok());
+    EXPECT_EQ(rejected_status.s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(queue_full_failure_count.load(), 1);
+    releaseLaneConnectHandler();
+    EXPECT_TRUE(fake_peer.waitForRequests(2, std::chrono::seconds(5)));
+    for (const auto batch : {accepted_batch, pending_batch}) {
+        EXPECT_TRUE(waitForBatchTerminal(h.engine.get(), batch, 1,
+                                        std::chrono::seconds(2)));
+        TransferStatus completed;
+        ASSERT_TRUE(h.engine->getTransferStatus(batch, 0, completed).ok());
+        EXPECT_EQ(completed.s, TransferStatusEnum::COMPLETED);
+    }
+    ASSERT_TRUE(h.engine->submitTransfer(recovery_batch, {request}).ok());
+    EXPECT_TRUE(fake_peer.waitForRequests(3, std::chrono::seconds(5)));
+    EXPECT_TRUE(waitForBatchTerminal(h.engine.get(), recovery_batch, 1,
+                                    std::chrono::seconds(2)));
+    TransferStatus recovered;
+    ASSERT_TRUE(h.engine->getTransferStatus(recovery_batch, 0, recovered).ok());
+    EXPECT_EQ(recovered.s, TransferStatusEnum::COMPLETED);
+    h.engine.reset();
+    for (const auto batch : {accepted_batch, pending_batch, rejected_batch,
+                            recovery_batch}) {
+        expectEverySliceCompletedExactlyOnceAfterShutdown(batch);
+        reclaimBatchDescAfterEngineShutdownForTest(batch);
+    }
+    hooks.reset();
+}
+
 TEST(TcpWriteVisibilityTest, PendingAdmissionTimesOutExactlyOnce) {
     constexpr size_t kLength = 64 * 1024;
     ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");

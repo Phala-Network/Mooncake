@@ -1,0 +1,61 @@
+name: Phala TCP pump recovery
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cpu-regression:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install CPU build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ninja-build libibverbs-dev libgoogle-glog-dev libjsoncpp-dev libnuma-dev libgflags-dev libyaml-cpp-dev libssl-dev libcurl4-openssl-dev libgtest-dev python3-dev
+      - name: Configure bounded CPU test build
+        run: cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF -DUSE_CUDA=OFF -DUSE_TENT=OFF -DUSE_ETCD=OFF -DUSE_REDIS=OFF -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF -DWITH_EP=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=ON
+      - name: Require regression on original runtime line
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('mooncake-transfer-engine/src/transport/tcp_transport/tcp_transport_lane_impl.h')
+          s = p.read_text()
+          old = '    if (pump_epoch != 0) postGroupPump(group, pump_epoch);'
+          boundary = '\n}\n\nvoid TcpTransport::postGroupPump('
+          assert s.count(old + boundary) == 1
+          p.write_text(s.replace(old + boundary, '    else if (pump_epoch != 0)\n        postGroupPump(group, pump_epoch);' + boundary))
+          PY
+          cmake --build build-cpu --target tcp_write_visibility_test -j2
+          set +e
+          timeout 60s build-cpu/mooncake-transfer-engine/tests/tcp_write_visibility_test --gtest_filter=TcpWriteVisibilityTest.ItemRejectionDoesNotStrandAlreadyAcceptedWork > red.log 2>&1
+          status=$?
+          set -e
+          cat red.log
+          test "$status" -eq 1
+          grep -q 'FAILED.*ItemRejectionDoesNotStrandAlreadyAcceptedWork' red.log
+      - name: Require recovery and TCP regression suite
+        run: |
+          git checkout -- mooncake-transfer-engine/src/transport/tcp_transport/tcp_transport_lane_impl.h
+          cmake --build build-cpu --target tcp_write_visibility_test -j2
+          timeout 180s build-cpu/mooncake-transfer-engine/tests/tcp_write_visibility_test --gtest_filter=TcpWriteVisibilityTest.ItemRejectionDoesNotStrandAlreadyAcceptedWork --gtest_repeat=10 > green.log 2>&1
+          cat green.log
+          timeout 300s build-cpu/mooncake-transfer-engine/tests/tcp_write_visibility_test > suite.log 2>&1
+          cat suite.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pumpfix-cpu-evidence
+          path: '*.log'
+  cuda13-wheel:
+    needs: cpu-regression
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda13
+      architecture: x86_64
+      python-versions: '["3.12"]'
+      artifact-prefix: phala-pumpfix
+      version-override: 0.3.13.post1+phala.1
