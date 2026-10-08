@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -29,8 +30,14 @@ excluded = re.compile(
 )
 bundled = {}
 raw_ldd = {}
+ldd_env = os.environ.copy()
+# The build extension already uses its install-time $ORIGIN search path.
+# Resolve the colocated build library before staging it into native-libs.
+ldd_env["LD_LIBRARY_PATH"] = str(build / "mooncake-common") + (
+    os.pathsep + ldd_env["LD_LIBRARY_PATH"] if ldd_env.get("LD_LIBRARY_PATH") else ""
+)
 for f in inputs:
-    raw = subprocess.check_output(["ldd", str(f)], text=True)
+    raw = subprocess.check_output(["ldd", str(f)], text=True, env=ldd_env)
     assert "not found" not in raw, raw
     raw_ldd[f.name] = raw
     shutil.copy2(f, native / f.name)
