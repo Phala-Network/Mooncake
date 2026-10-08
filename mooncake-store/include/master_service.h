@@ -40,6 +40,7 @@
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 #include "master_config.h"
+#include "metadata_key_budget.h"
 #include "rpc_types.h"
 #include "replica.h"
 #include "ha/ha_types.h"
@@ -79,6 +80,7 @@ struct MetadataStoragePlugin;
 // Forward declarations for test classes
 namespace test {
 class MasterServiceTest;
+class MetadataKeyBudgetTest;
 class MasterServiceSnapshotTestBase;
 class SnapshotChildProcessTest;
 // Friended so the promotion-on-hit tests can drive a serialize/reset/
@@ -144,6 +146,7 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  */
 class MasterService {
     // Test friend class for snapshot/restore testing
+    friend class test::MetadataKeyBudgetTest;
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::MasterServiceTest;
     friend class test::SnapshotChildProcessTest;
@@ -1044,6 +1047,8 @@ class MasterService {
             std::vector<ReplicaID> eligible_replica_ids;
         };
 
+        MetadataKeyBudget::Reservation key_slot;
+
         // RAII-style metric management
         ~ObjectMetadata() {
             MasterMetricManager::instance().dec_key_count(1);
@@ -1686,6 +1691,8 @@ class MasterService {
         // excluding disk-only objects from the eviction denominator.
         long disk_object_count GUARDED_BY(mutex) = 0;
     };
+    // Outlives all reservations held by the shards.
+    MetadataKeyBudget metadata_key_budget_;
     std::array<MetadataShard, kNumShards> metadata_shards_;
 
     class SoftPinDeadlineIndex {
@@ -2278,13 +2285,15 @@ class MasterService {
             MaybeEraseEmptyTenant();
         }
 
-        void Create(const UUID& client_id, uint64_t total_length,
+        bool Create(const UUID& client_id, uint64_t total_length,
                     std::vector<Replica> replicas, bool enable_hard_pin = false,
                     ObjectDataType data_type = ObjectDataType::UNKNOWN,
                     std::string group_id = "") {
             if (Exists()) {
                 throw std::logic_error("Already exists");
             }
+            auto slot = service_->metadata_key_budget_.TryAcquire();
+            if (!slot) return false;
             const auto now = std::chrono::system_clock::now();
             EnsureTenantState();
             auto result = tenant_state_->metadata.emplace(
@@ -2295,6 +2304,8 @@ class MasterService {
                     std::nullopt, enable_hard_pin, data_type, group_id,
                     object_id_.tenant_id, object_id_.user_key));
             it_ = result.first;
+            it_->second.key_slot = std::move(*slot);
+            return true;
         }
 
        private:

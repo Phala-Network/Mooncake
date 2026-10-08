@@ -2972,7 +2972,20 @@ BucketStorageBackend::PrepareEviction(
         pending_write_keys_.insert(write_keys.begin(), write_keys.end());
     }
 
+    size_t own_pending_eviction_keys = 0;
+    // Other transactions may restore their victims on notification failure.
+    // Only this transaction's victims may fund its own reserved write.
+    const auto keys_over_cap = [&] {
+        return file_storage_config_.total_keys_limit > 0 &&
+               object_bucket_map_.size() + pending_write_keys_.size() +
+                       pending_eviction_keys_.size() - own_pending_eviction_keys >
+                   static_cast<uint64_t>(file_storage_config_.total_keys_limit);
+    };
     if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
+        if (keys_over_cap()) {
+            RestorePreparedEvictionLocked(std::move(result));
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
         return result;
     }
 
@@ -3060,7 +3073,8 @@ BucketStorageBackend::PrepareEviction(
         // blind to cgroup/emptyDir quotas).
         bool phys_exceeded = phys_over_cap(accumulated_freed_space);
 
-        if (!quota_exceeded && !disk_still_full && !phys_exceeded) break;
+        if (!quota_exceeded && !disk_still_full && !phys_exceeded &&
+            !keys_over_cap()) break;
 
         if (evict_count == 0) {
             LOG(INFO) << "[Evict] triggered: total=" << total_size_ << "/"
@@ -3097,7 +3111,8 @@ BucketStorageBackend::PrepareEviction(
 
         // Collect for notification and file deletion.
         for (const auto& key : evict_meta->keys) {
-            pending_eviction_keys_.insert(key);
+            own_pending_eviction_keys +=
+                pending_eviction_keys_.insert(key).second ? 1 : 0;
             result.keys.push_back(key);
         }
         accumulated_freed_space +=
@@ -3116,7 +3131,8 @@ BucketStorageBackend::PrepareEviction(
     // rather than overrun the disk quota and get OOM-evicted.
     const bool phys_exceeded = phys_over_cap(accumulated_freed_space);
     pending_eviction_size_ += result.evicted_size;
-    if (!write_keys.empty() && (quota_exceeded || phys_exceeded)) {
+    if (!write_keys.empty() &&
+        (quota_exceeded || phys_exceeded || keys_over_cap())) {
         RestorePreparedEvictionLocked(std::move(result));
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }

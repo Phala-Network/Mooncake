@@ -126,6 +126,7 @@ struct MasterConfig {
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    uint64_t metadata_key_limit = 0;  // 0 = unlimited live + reserved keys
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
 
@@ -243,6 +244,7 @@ class MasterServiceSupervisorConfig {
     bool enable_cxl = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    uint64_t metadata_key_limit = 0;  // 0 = unlimited live + reserved keys
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
@@ -303,6 +305,7 @@ class MasterServiceSupervisorConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        metadata_key_limit = config.metadata_key_limit;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
@@ -499,6 +502,7 @@ class WrappedMasterServiceConfig {
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    uint64_t metadata_key_limit = 0;  // 0 = unlimited live + reserved keys
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
@@ -593,6 +597,7 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        metadata_key_limit = config.metadata_key_limit;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
@@ -717,6 +722,7 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        metadata_key_limit = config.metadata_key_limit;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
@@ -1176,6 +1182,7 @@ class MasterServiceConfig {
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    uint64_t metadata_key_limit = 0;  // 0 = unlimited live + reserved keys
     size_t offloading_queue_limit = 50000;
     double offload_cap_ratio = 0.5;
     bool promotion_on_hit = false;
@@ -1266,6 +1273,7 @@ class MasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        metadata_key_limit = config.metadata_key_limit;
         offloading_queue_limit = config.offloading_queue_limit;
         offload_cap_ratio = config.offload_cap_ratio;
         promotion_on_hit = config.promotion_on_hit;
