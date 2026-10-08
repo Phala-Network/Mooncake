@@ -6,15 +6,17 @@ permissions:
 jobs:
   cpu-regression:
     runs-on: ubuntu-22.04
+    container: ubuntu:24.04
     timeout-minutes: 35
     steps:
+      - name: Install CPU build dependencies
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y git ca-certificates cmake build-essential ninja-build libibverbs-dev libgoogle-glog-dev libjsoncpp-dev libnuma-dev libgflags-dev libyaml-cpp-dev libssl-dev libcurl4-openssl-dev libgtest-dev python3-dev
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - name: Install CPU build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ninja-build libibverbs-dev libgoogle-glog-dev libjsoncpp-dev libnuma-dev libgflags-dev libyaml-cpp-dev libssl-dev libcurl4-openssl-dev libgtest-dev python3-dev
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Configure bounded CPU test build
         run: cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF -DUSE_CUDA=OFF -DUSE_TENT=OFF -DUSE_ETCD=OFF -DUSE_REDIS=OFF -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF -DWITH_EP=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=ON
       - name: Require regression on original runtime line
