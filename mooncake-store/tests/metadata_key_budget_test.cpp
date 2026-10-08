@@ -43,7 +43,7 @@ TEST(MetadataKeyBudgetReservation, ConcurrentReservationsNeverOverbook) {
 }
 
 class MetadataKeyBudgetTest : public ::testing::Test {
- protected:
+   protected:
     uint64_t Used(MasterService& service) {
         return service.metadata_key_budget_.Used();
     }
@@ -82,27 +82,27 @@ TEST_F(MetadataKeyBudgetTest, PendingWritesFailureRevokeAndExistingRead) {
                                   1024, replication));
     EXPECT_EQ(Used(service), 0);
     client = Mount(service);
-    ASSERT_TRUE(service.PutStart(client, "a", TenantId::Default(), 1024,
-                                 replication));
-    ASSERT_TRUE(service.PutStart(client, "b", TenantId::Default(), 1024,
-                                 replication));
+    ASSERT_TRUE(
+        service.PutStart(client, "a", TenantId::Default(), 1024, replication));
+    ASSERT_TRUE(
+        service.PutStart(client, "b", TenantId::Default(), 1024, replication));
     EXPECT_EQ(Used(service), 2);
-    auto full = service.PutStart(client, "c", TenantId::Default(), 1024,
-                                 replication);
+    auto full =
+        service.PutStart(client, "c", TenantId::Default(), 1024, replication);
     ASSERT_FALSE(full);
     EXPECT_EQ(full.error(), ErrorCode::NO_AVAILABLE_HANDLE);
-    auto duplicate = service.PutStart(client, "a", TenantId::Default(), 1024,
-                                      replication);
+    auto duplicate =
+        service.PutStart(client, "a", TenantId::Default(), 1024, replication);
     ASSERT_FALSE(duplicate);
     EXPECT_EQ(duplicate.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
-    ASSERT_TRUE(service.PutEnd(client, "a", TenantId::Default(),
-                               ReplicaType::MEMORY));
+    ASSERT_TRUE(
+        service.PutEnd(client, "a", TenantId::Default(), ReplicaType::MEMORY));
     EXPECT_TRUE(service.GetReplicaList("a", TenantId::Default()));
     ASSERT_TRUE(service.PutRevoke(client, "b", TenantId::Default(),
                                   ReplicaType::MEMORY));
     EXPECT_EQ(Used(service), 1);
-    EXPECT_TRUE(service.PutStart(client, "c", TenantId::Default(), 1024,
-                                 replication));
+    EXPECT_TRUE(
+        service.PutStart(client, "c", TenantId::Default(), 1024, replication));
     EXPECT_EQ(Used(service), 2);
 }
 
@@ -117,11 +117,14 @@ TEST_F(MetadataKeyBudgetTest, ConcurrentPutsAcrossShardsRespectTotalLimit) {
     for (int i = 0; i < 32; ++i) {
         threads.emplace_back([&, i] {
             while (!go.load()) std::this_thread::yield();
-            auto result = service.PutStart(
-                client, "parallel-" + std::to_string(i), TenantId::Default(),
-                1024, ReplicateConfig{});
-            if (result) ++successes;
-            else EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+            auto result =
+                service.PutStart(client, "parallel-" + std::to_string(i),
+                                 TenantId::Default(), 1024, ReplicateConfig{});
+            if (result) {
+                ++successes;
+            } else {
+                EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+            }
         });
     }
     go = true;
@@ -136,10 +139,12 @@ TEST_F(MetadataKeyBudgetTest, DiskRegistrationAndSnapshotAlsoConsumeSlots) {
     MasterService service(config);
     auto client = generate_uuid();
     Replica disk(client, 1024, "disk-endpoint", ReplicaStatus::COMPLETE);
-    ASSERT_TRUE(service.AddReplica(client, "disk-a", TenantId::Default(), disk));
+    ASSERT_TRUE(
+        service.AddReplica(client, "disk-a", TenantId::Default(), disk));
     EXPECT_EQ(Used(service), 1);
     // Refreshing the existing disk replica must not need another slot.
-    EXPECT_TRUE(service.AddReplica(client, "disk-a", TenantId::Default(), disk));
+    EXPECT_TRUE(
+        service.AddReplica(client, "disk-a", TenantId::Default(), disk));
     auto full = service.AddReplica(client, "disk-b", TenantId::Default(), disk);
     ASSERT_FALSE(full);
     EXPECT_EQ(full.error(), ErrorCode::NO_AVAILABLE_HANDLE);
@@ -150,11 +155,12 @@ TEST_F(MetadataKeyBudgetTest, DiskRegistrationAndSnapshotAlsoConsumeSlots) {
     EXPECT_EQ(Used(restored), 1);
     ASSERT_TRUE(Restore(restored, snapshot));
     EXPECT_EQ(Used(restored), 1);
-    EXPECT_FALSE(restored.AddReplica(client, "disk-b", TenantId::Default(), disk));
+    EXPECT_FALSE(
+        restored.AddReplica(client, "disk-b", TenantId::Default(), disk));
 }
 
 class BucketKeyBudgetTest : public ::testing::Test {
- protected:
+   protected:
     void SetUp() override {
         static std::atomic<int> sequence{0};
         path = std::filesystem::temp_directory_path() /
@@ -168,7 +174,8 @@ class BucketKeyBudgetTest : public ::testing::Test {
     auto Batch(std::initializer_list<const char*> keys) {
         std::unordered_map<std::string, std::vector<Slice>> batch;
         for (auto key : keys)
-            batch.emplace(key, std::vector<Slice>{{value.data(), value.size()}});
+            batch.emplace(key,
+                          std::vector<Slice>{{value.data(), value.size()}});
         return batch;
     }
     static ErrorCode Complete(const std::vector<std::string>&,
@@ -221,9 +228,12 @@ TEST_F(BucketKeyBudgetTest, FailedNotificationPreservesConcurrentReservation) {
     auto failed = backend.BatchOffload(
         Batch({"new-a", "new-b"}), Complete,
         [&](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
-            auto concurrent = backend.BatchOffload(Batch({"concurrent"}), Complete);
+            auto concurrent =
+                backend.BatchOffload(Batch({"concurrent"}), Complete);
             EXPECT_FALSE(concurrent);
-            if (!concurrent) EXPECT_EQ(concurrent.error(), ErrorCode::FILE_WRITE_FAIL);
+            if (!concurrent) {
+                EXPECT_EQ(concurrent.error(), ErrorCode::FILE_WRITE_FAIL);
+            }
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         });
     ASSERT_FALSE(failed);
@@ -245,12 +255,13 @@ TEST_F(BucketKeyBudgetTest, PendingWriteAndCompletionFailureReleaseSlots) {
     BucketStorageBackend backend(config, buckets);
     ASSERT_TRUE(backend.Init());
     // An incoming bucket larger than the key budget must leave no reservation.
-    EXPECT_FALSE(backend.BatchOffload(Batch({"too-big-a", "too-big-b"}), Complete));
-    auto failed = backend.BatchOffload(
-        Batch({"will-fail"}),
-        [](const std::vector<std::string>&, std::vector<StorageObjectMetadata>&) {
-            return ErrorCode::INTERNAL_ERROR;
-        });
+    EXPECT_FALSE(
+        backend.BatchOffload(Batch({"too-big-a", "too-big-b"}), Complete));
+    auto failed = backend.BatchOffload(Batch({"will-fail"}),
+                                       [](const std::vector<std::string>&,
+                                          std::vector<StorageObjectMetadata>&) {
+                                           return ErrorCode::INTERNAL_ERROR;
+                                       });
     EXPECT_FALSE(failed);
     EXPECT_FALSE(*backend.IsExist("will-fail"));
     EXPECT_TRUE(backend.BatchOffload(Batch({"retry"}), Complete));

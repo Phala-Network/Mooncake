@@ -913,7 +913,8 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
             static_cast<size_t>(FLAGS_offloading_queue_limit);
     }
     if ((google::GetCommandLineFlagInfo("metadata_key_limit", &info) &&
-         !info.is_default) || !conf_set) {
+         !info.is_default) ||
+        !conf_set) {
         master_config.metadata_key_limit = FLAGS_metadata_key_limit;
     }
     if ((google::GetCommandLineFlagInfo("offload_cap_ratio", &info) &&

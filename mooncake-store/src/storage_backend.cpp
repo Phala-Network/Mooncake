@@ -2978,7 +2978,8 @@ BucketStorageBackend::PrepareEviction(
     const auto keys_over_cap = [&] {
         return file_storage_config_.total_keys_limit > 0 &&
                object_bucket_map_.size() + pending_write_keys_.size() +
-                       pending_eviction_keys_.size() - own_pending_eviction_keys >
+                       pending_eviction_keys_.size() -
+                       own_pending_eviction_keys >
                    static_cast<uint64_t>(file_storage_config_.total_keys_limit);
     };
     if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
@@ -3074,7 +3075,8 @@ BucketStorageBackend::PrepareEviction(
         bool phys_exceeded = phys_over_cap(accumulated_freed_space);
 
         if (!quota_exceeded && !disk_still_full && !phys_exceeded &&
-            !keys_over_cap()) break;
+            !keys_over_cap())
+            break;
 
         if (evict_count == 0) {
             LOG(INFO) << "[Evict] triggered: total=" << total_size_ << "/"

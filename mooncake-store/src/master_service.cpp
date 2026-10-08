@@ -3215,7 +3215,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
     }
 
     auto restore_slots = metadata_key_budget_.TryAcquire(objects.size());
-    if (!restore_slots) return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    if (!restore_slots)
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
 
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
         MasterMetricManager::instance().dec_allocated_mem_size(
@@ -3247,7 +3248,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                     standby_meta.hard_pinned.value_or(false),
                     standby_meta.data_type, standby_meta.group_id,
                     object.tenant_id, object.user_key));
-            if (inserted) metadata_it->second.key_slot = restore_slots->TakeOne();
+            if (inserted)
+                metadata_it->second.key_slot = restore_slots->TakeOne();
             if (!standby_meta.group_id.empty()) {
                 RegisterGroupMember(tenant_state, object.tenant_id,
                                     object.user_key, standby_meta.group_id);
@@ -4700,10 +4702,11 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     const ObjectIdentity object_id{std::move(normalized_tenant), key};
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
-        if (!accessor.Create(
-            client_id,
-            replica.get_descriptor().get_local_disk_descriptor().object_size,
-            std::vector<Replica>{})) {
+        if (!accessor.Create(client_id,
+                             replica.get_descriptor()
+                                 .get_local_disk_descriptor()
+                                 .object_size,
+                             std::vector<Replica>{})) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
     }
@@ -11716,8 +11719,9 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
     auto restore_slots = service_->metadata_key_budget_.TryAcquire(
         metadata_array->via.array.size);
     if (!restore_slots) {
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL, "Snapshot exceeds metadata key limit"));
+        return tl::make_unexpected(
+            SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                               "Snapshot exceeds metadata key limit"));
     }
 
     shard.tenants.reserve(metadata_array->via.array.size);
