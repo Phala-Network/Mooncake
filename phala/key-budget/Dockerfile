@@ -2,6 +2,8 @@ ARG BASE_IMAGE=ghcr.io/phala-network/sglang@sha256:82293d51ff2fda7922f7d37b9ebbe
 FROM ${BASE_IMAGE}
 ARG MOONCAKE_REVISION
 LABEL org.opencontainers.image.source="https://github.com/Phala-Network/Mooncake" \
+      org.opencontainers.image.revision="${MOONCAKE_REVISION}" \
+      org.opencontainers.image.version="0.3.13-phala-keybudget1" \
       io.phala.mooncake.native.revision="${MOONCAKE_REVISION}" \
       io.phala.mooncake.profile="host-tcp-ssd-key-budget" \
       io.phala.mooncake.provenance="/opt/phala/mooncake/native-overlay.json"
