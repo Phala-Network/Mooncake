@@ -170,7 +170,8 @@ tl::expected<std::string, ErrorCode> GetGroupIdForKey(
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
 MasterService::MasterService(const MasterServiceConfig& config)
-    : graceful_unmount_scheduler_(
+    : metadata_key_budget_(config.metadata_key_limit),
+      graceful_unmount_scheduler_(
           [this](const GracefulUnmountDeadlineRecord& record) {
               auto result =
                   this->UnmountSegment(record.segment_id, record.client_id);
@@ -3213,6 +3214,10 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
         }
     }
 
+    auto restore_slots = metadata_key_budget_.TryAcquire(objects.size());
+    if (!restore_slots)
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
         MasterMetricManager::instance().dec_allocated_mem_size(
             segment, static_cast<int64_t>(bytes));
@@ -3234,7 +3239,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
             const auto& standby_meta = object.entry->metadata;
             auto& tenant_state =
                 GetOrCreateTenantState(shard.get(), object.tenant_id);
-            tenant_state.metadata.emplace(
+            auto [metadata_it, inserted] = tenant_state.metadata.emplace(
                 std::piecewise_construct,
                 std::forward_as_tuple(object.user_key),
                 std::forward_as_tuple(
@@ -3243,6 +3248,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                     standby_meta.hard_pinned.value_or(false),
                     standby_meta.data_type, standby_meta.group_id,
                     object.tenant_id, object.user_key));
+            if (inserted)
+                metadata_it->second.key_slot = restore_slots->TakeOne();
             if (!standby_meta.group_id.empty()) {
                 RegisterGroupMember(tenant_state, object.tenant_id,
                                     object.user_key, standby_meta.group_id);
@@ -4040,6 +4047,9 @@ auto MasterService::AllocateAndInsertMetadata(
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
 
+    auto key_slot = metadata_key_budget_.TryAcquire();
+    if (!key_slot) return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+
     const uint64_t pending_quota_charge =
         RequestedMemoryQuotaCharge(value_length, config);
     auto quota_result =
@@ -4265,6 +4275,7 @@ auto MasterService::AllocateAndInsertMetadata(
         refund_pending_quota();
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
+    it->second.key_slot = std::move(*key_slot);
     if (enable_multi_tenants_) {
         auto adopt_result = it->second.quota_ledger.AdoptPendingCharge(
             GetBoundTenantQuotaHandle(tenant_state), pending_quota_charge);
@@ -4691,10 +4702,13 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     const ObjectIdentity object_id{std::move(normalized_tenant), key};
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
-        accessor.Create(
-            client_id,
-            replica.get_descriptor().get_local_disk_descriptor().object_size,
-            std::vector<Replica>{});
+        if (!accessor.Create(client_id,
+                             replica.get_descriptor()
+                                 .get_local_disk_descriptor()
+                                 .object_size,
+                             std::vector<Replica>{})) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
     }
     auto& metadata = accessor.Get();
     if (replica.type() != ReplicaType::LOCAL_DISK) {
@@ -11702,6 +11716,14 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                                "Missing or invalid 'metadata' field in shard"));
     }
 
+    auto restore_slots = service_->metadata_key_budget_.TryAcquire(
+        metadata_array->via.array.size);
+    if (!restore_slots) {
+        return tl::make_unexpected(
+            SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                               "Snapshot exceeds metadata key limit"));
+    }
+
     shard.tenants.reserve(metadata_array->via.array.size);
 
     for (uint32_t j = 0; j < metadata_array->via.array.size; ++j) {
@@ -11745,6 +11767,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                 metadata_ptr->IsHardPinned(), metadata_ptr->data_type,
                 metadata_ptr->group_id, tenant_id, user_key));
 
+        if (inserted) it->second.key_slot = restore_slots->TakeOne();
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.object_checksum = metadata_ptr->object_checksum;
 

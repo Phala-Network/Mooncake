@@ -189,6 +189,8 @@ DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
 DEFINE_bool(offload_force_evict, false,
             "Force-evict objects exceeding offload cap without disk offload");
+DEFINE_uint64(metadata_key_limit, 0,
+              "Maximum live and reserved object metadata keys; 0 is unlimited");
 DEFINE_uint64(offloading_queue_limit, 50000,
               "Maximum number of objects allowed in the offloading queue per "
               "local disk segment. Increase to allow more objects to be "
@@ -531,6 +533,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
         master_config.offloading_queue_limit =
             static_cast<size_t>(tmp_offloading_queue_limit);
     }
+    default_config.GetUInt64("metadata_key_limit",
+                             &master_config.metadata_key_limit,
+                             FLAGS_metadata_key_limit);
     default_config.GetDouble("offload_cap_ratio",
                              &master_config.offload_cap_ratio,
                              FLAGS_offload_cap_ratio);
@@ -906,6 +911,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.offloading_queue_limit =
             static_cast<size_t>(FLAGS_offloading_queue_limit);
+    }
+    if ((google::GetCommandLineFlagInfo("metadata_key_limit", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.metadata_key_limit = FLAGS_metadata_key_limit;
     }
     if ((google::GetCommandLineFlagInfo("offload_cap_ratio", &info) &&
          !info.is_default) ||
@@ -1541,6 +1551,7 @@ int main(int argc, char* argv[]) {
         << ", kv_events_backend_id=" << master_config.kv_events_backend_id
         << ", offload_on_evict=" << master_config.offload_on_evict
         << ", offload_force_evict=" << master_config.offload_force_evict
+        << ", metadata_key_limit=" << master_config.metadata_key_limit
         << ", offloading_queue_limit=" << master_config.offloading_queue_limit
         << ", offload_cap_ratio=" << master_config.offload_cap_ratio
         << ", ha_backend_type=" << master_config.ha_backend_type
