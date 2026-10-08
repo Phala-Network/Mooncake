@@ -72,7 +72,7 @@ for f in inputs:
         ],
         check=True,
     )
-shutil.copy2(source / "LICENSE", licenses / "Mooncake.LICENSE")
+shutil.copy2(source / "LICENSE-APACHE", licenses / "Mooncake.LICENSE")
 manifest = {
     "source_repository": "https://github.com/Phala-Network/Mooncake",
     "source_revision": actual,
