@@ -777,6 +777,11 @@ class MasterServiceHATest : public ::testing::Test {
                    : allocators->front()->size();
     }
 
+    static bool HasSegmentForTesting(MasterService& service, const UUID& id) {
+        std::string name, endpoint;
+        return service.segment_manager_.GetSegmentBasicInfo(id, name, endpoint);
+    }
+
     static void EraseObjectForTesting(MasterService& service,
                                       const TenantId& tenant_id,
                                       const std::string& key) {
@@ -2401,6 +2406,10 @@ TEST_F(MasterServiceHATest, DestructorJoinsTerminalCallbackAfterLocalHandlesEnd)
     auto entered = write_entered.get_future();
     std::promise<void> release_write;
     auto released = release_write.get_future().share();
+    std::promise<void> callback_entered;
+    auto callback_started = callback_entered.get_future();
+    std::promise<void> release_callback;
+    auto callback_released = release_callback.get_future().share();
     std::atomic<bool> callback_ran{false};
     std::weak_ptr<std::atomic<bool>> terminal_lifetime;
     std::weak_ptr<std::mutex> gate_lifetime;
@@ -2434,8 +2443,11 @@ TEST_F(MasterServiceHATest, DestructorJoinsTerminalCallbackAfterLocalHandlesEnd)
         terminal_lifetime = writer_terminal;
         gate_lifetime = serving_gate;
         service->SetBatchOpLogTerminalCallback(
-            [writer_terminal, serving_gate, &callback_ran](const auto& state) {
+            [writer_terminal, serving_gate, &callback_ran, &callback_entered,
+             callback_released](const auto& state) {
                 std::lock_guard<std::mutex> lock(*serving_gate);
+                callback_entered.set_value();
+                callback_released.wait();
                 EXPECT_EQ(ErrorCode::INVALID_PARAMS, state.error);
                 EXPECT_FALSE(writer_terminal->exchange(true));
                 callback_ran.store(true);
@@ -2450,10 +2462,16 @@ TEST_F(MasterServiceHATest, DestructorJoinsTerminalCallbackAfterLocalHandlesEnd)
     EXPECT_EQ(std::future_status::ready,
               entered.wait_for(std::chrono::seconds(2)));
 
+    // Stop intentionally suppresses new terminal notifications. Exercise an
+    // already-running callback, which teardown must join while captures live.
+    release_write.set_value();
+    const auto started = callback_started.wait_for(std::chrono::seconds(2));
+    if (started != std::future_status::ready) release_callback.set_value();
+    ASSERT_EQ(std::future_status::ready, started);
     auto teardown = std::async(std::launch::async, [&] { service.reset(); });
     EXPECT_EQ(std::future_status::timeout,
               teardown.wait_for(std::chrono::milliseconds(20)));
-    release_write.set_value();
+    release_callback.set_value();
     ASSERT_EQ(std::future_status::ready,
               teardown.wait_for(std::chrono::seconds(3)));
     teardown.get();
@@ -3828,16 +3846,19 @@ TEST_F(MasterServiceHATest, SegmentLifecycleWritesBatchRecordOpLogs) {
     const UUID client_id = generate_uuid();
     Segment mounted = MakeSegment("batch_segment_mount");
     ASSERT_TRUE(service.MountSegment(mounted, client_id).has_value());
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord durable;
+    ReadBatchEventually(storage, 1, durable);
 
     const UUID remount_client_id = generate_uuid();
     Segment remounted = MakeSegment("batch_segment_remount",
                                     kDefaultSegmentBase + kDefaultSegmentSize);
     ASSERT_TRUE(
         service.ReMountSegment({remounted}, remount_client_id).has_value());
+    ReadBatchEventually(storage, 2, durable);
 
     ASSERT_TRUE(service.UnmountSegment(mounted.id, client_id).has_value());
 
-    OpLogBatchStorage storage(cluster_id, *backend);
     auto read_batch = [&](uint64_t batch_id) {
         OpLogBatchRecord batch;
         ErrorCode read_err = ErrorCode::ETCD_KEY_NOT_EXIST;
@@ -3869,6 +3890,54 @@ TEST_F(MasterServiceHATest, SegmentLifecycleWritesBatchRecordOpLogs) {
     EXPECT_EQ(OpType::SEGMENT_UNMOUNT, unmount_batch.entries[0].op_type);
     EXPECT_EQ(3u, unmount_batch.entries[0].sequence_id);
     EXPECT_FALSE(unmount_batch.entries[0].payload.empty());
+}
+
+TEST_F(MasterServiceHATest, SegmentBackpressureRejectsBeforeMutation) {
+    const std::string cluster_id = "segment_backpressure_before_mutation";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build());
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto client_id = generate_uuid();
+    auto mounted = MakeSegment("backpressure_mounted");
+    ASSERT_TRUE(service.MountSegment(mounted, client_id).has_value());
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    auto new_segment = MakeSegment("backpressure_new",
+                                    kDefaultSegmentBase + kDefaultSegmentSize);
+    auto new_client = generate_uuid();
+    {
+        // Hold the only queue reservation deterministically, without races
+        // against the writer's transaction or sleep-based timing assumptions.
+        auto held = ReserveBatchSlotForTesting(service);
+        ASSERT_TRUE(held.has_value());
+        auto mount = service.MountSegment(new_segment, new_client);
+        EXPECT_FALSE(mount.has_value());
+        if (!mount) EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, mount.error());
+        EXPECT_FALSE(HasSegmentForTesting(service, new_segment.id));
+        auto remount = service.ReMountSegment({new_segment}, new_client);
+        EXPECT_FALSE(remount.has_value());
+        if (!remount) EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, remount.error());
+        EXPECT_FALSE(HasSegmentForTesting(service, new_segment.id));
+        auto unmount = service.UnmountSegment(mounted.id, client_id);
+        EXPECT_FALSE(unmount.has_value());
+        if (!unmount) EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, unmount.error());
+        EXPECT_TRUE(HasSegmentForTesting(service, mounted.id));
+    }
+    // Releasing pressure permits retry and the mutation must be logged.
+    ASSERT_TRUE(service.UnmountSegment(mounted.id, client_id).has_value());
+    ReadBatchEventually(storage, 2, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::SEGMENT_UNMOUNT, batch.entries[0].op_type);
+    EXPECT_FALSE(HasSegmentForTesting(service, mounted.id));
+    ASSERT_TRUE(service.ReMountSegment({new_segment}, new_client).has_value());
+    ReadBatchEventually(storage, 3, batch);
+    EXPECT_TRUE(HasSegmentForTesting(service, new_segment.id));
 }
 
 TEST_F(MasterServiceHATest, NotifyPromotionSuccessWritesBatchRecordOpLog) {

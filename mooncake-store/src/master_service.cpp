@@ -892,6 +892,12 @@ MasterService::DeleteTenantQuotaPolicy(const TenantId& tenant_id) {
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    std::optional<OrderedOpLogWriter::Reservation> oplog_slot;
+    if (enable_oplog_) {
+        auto reserved = ReserveBatchOpLogSlot();
+        if (!reserved) return tl::make_unexpected(reserved.error());
+        oplog_slot.emplace(std::move(reserved.value()));
+    }
     ErrorCode mount_result = ErrorCode::OK;
     {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -940,9 +946,11 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         op.is_memory_segment = true;
         op.file_path.clear();
         auto bytes = struct_pack::serialize(op);
-        PersistSegmentOpForHAOrEnqueue("MountSegment", OpType::SEGMENT_MOUNT,
-                                       segment.te_endpoint,
-                                       std::string(bytes.begin(), bytes.end()));
+        auto persisted = AppendReservedOpLogWithDurableFinalize(
+            std::move(*oplog_slot), OpType::SEGMENT_MOUNT,
+            TenantId::Default().value(), segment.te_endpoint,
+            std::string(bytes.begin(), bytes.end()), nullptr);
+        if (!persisted) return tl::make_unexpected(persisted.error());
     }
     UpdateClientHostId(client_id, segment.host_id);
     if (mount_result == ErrorCode::OK) {
@@ -1003,6 +1011,17 @@ ErrorCode MasterService::ValidateStandbyRemountSegment(
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    // Reserve all log entries before changing allocators or client state.
+    // Otherwise queue backpressure can silently omit an already-applied mount.
+    std::vector<OrderedOpLogWriter::Reservation> oplog_slots;
+    if (enable_oplog_) {
+        oplog_slots.reserve(segments.size());
+        for (size_t i = 0; i < segments.size(); ++i) {
+            auto reserved = ReserveBatchOpLogSlot();
+            if (!reserved) return tl::make_unexpected(reserved.error());
+            oplog_slots.push_back(std::move(reserved.value()));
+        }
+    }
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
         std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
@@ -1285,6 +1304,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     }
 
     if (enable_oplog_ && ordered_oplog_writer_) {
+        size_t log_index = 0;
         for (const auto& seg : segments) {
             SegmentMountOp op;
             op.segment_name = seg.name;
@@ -1293,9 +1313,11 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             op.is_memory_segment = true;
             op.file_path.clear();
             auto bytes = struct_pack::serialize(op);
-            PersistSegmentOpForHAOrEnqueue(
-                "ReMountSegment", OpType::SEGMENT_MOUNT, seg.name,
-                std::string(bytes.begin(), bytes.end()));
+            auto persisted = AppendReservedOpLogWithDurableFinalize(
+                std::move(oplog_slots[log_index++]), OpType::SEGMENT_MOUNT,
+                TenantId::Default().value(), seg.name,
+                std::string(bytes.begin(), bytes.end()), nullptr);
+            if (!persisted) return tl::make_unexpected(persisted.error());
         }
     }
     RecomputeTenantEffectiveQuotas();
@@ -2640,6 +2662,12 @@ void MasterService::TaskCleanupThreadFunc() {
 auto MasterService::UnmountSegment(const UUID& segment_id,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    std::optional<OrderedOpLogWriter::Reservation> oplog_slot;
+    if (enable_oplog_) {
+        auto reserved = ReserveBatchOpLogSlot();
+        if (!reserved) return tl::make_unexpected(reserved.error());
+        oplog_slot.emplace(std::move(reserved.value()));
+    }
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
@@ -2661,10 +2689,14 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         }
     }
 
-    // Keep HA, snapshot, and CXL behavior unchanged. Regular memory segments
-    // become unreadable as soon as PrepareUnmountSegment releases their
-    // allocator; only the physical metadata sweep is deferred.
-    if (enable_async_segment_cleanup_) {
+    // The allocator is already invalid, so readers cannot use this segment.
+    // HA cleanup emits its own REMOVE records: defer it until the reserved
+    // unmount is durable, otherwise a one-slot queue is exhausted by our own
+    // reservation and cleanup cannot release object/quota state.
+    const bool cleanup_after_durable = enable_oplog_ && ordered_oplog_writer_;
+    if (cleanup_after_durable) {
+        // Scheduled as the unmount's durable callback below.
+    } else if (enable_async_segment_cleanup_) {
         replica_cleanup_worker_.Schedule();
     } else {
         ClearInvalidHandles(alive_clients);
@@ -2692,9 +2724,15 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     if (enable_oplog_ && ordered_oplog_writer_ && !te_endpoint.empty()) {
         SegmentUnmountOp op{te_endpoint};
         auto bytes = struct_pack::serialize(op);
-        PersistSegmentOpForHAOrEnqueue("UnmountSegment",
-                                       OpType::SEGMENT_UNMOUNT, te_endpoint,
-                                       std::string(bytes.begin(), bytes.end()));
+        auto persisted = AppendReservedOpLogWithDurableFinalize(
+            std::move(*oplog_slot), OpType::SEGMENT_UNMOUNT,
+            TenantId::Default().value(), te_endpoint,
+            std::string(bytes.begin(), bytes.end()),
+            [this](const OpLogEntry&) { ClearInvalidHandles(); });
+        if (!persisted) return tl::make_unexpected(persisted.error());
+    } else if (cleanup_after_durable) {
+        oplog_slot.reset();
+        ClearInvalidHandles(alive_clients);
     }
     RecomputeTenantEffectiveQuotas();
     return {};

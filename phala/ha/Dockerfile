@@ -40,5 +40,7 @@ FROM ghcr.io/phala-network/sglang:v0.5.21-phala-1@sha256:b4b08139f9180cbd09ddf14
 USER root
 COPY --from=build /build/mooncake-store/src/mooncake_master /opt/sglang/bin/mooncake_master
 COPY --from=build /build/mooncake-common/etcd/libetcd_wrapper.so /usr/local/lib/libetcd_wrapper.so
+COPY --from=build /build/mooncake-common/libasio.so /usr/local/lib/libasio.so
+COPY --from=build /usr/lib/x86_64-linux-gnu/libyaml-cpp.so.0.8 /usr/lib/x86_64-linux-gnu/libyaml-cpp.so.0.8
 RUN ldconfig && ! ldd /opt/sglang/bin/mooncake_master | grep 'not found'
 ENTRYPOINT ["/opt/sglang/bin/mooncake_master"]
