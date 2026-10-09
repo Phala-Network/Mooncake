@@ -116,6 +116,26 @@ ErrorCode EtcdHelper::CreateWithLease(const char* key, const size_t key_size,
     }
 }
 
+ErrorCode EtcdHelper::CreateWithLeaseIfFirstCandidate(
+    std::string_view key, std::string_view value, EtcdLeaseId lease_id,
+    std::string_view candidate_prefix, std::string_view candidate_key,
+    EtcdLeaseId candidate_lease, EtcdRevisionId candidate_revision,
+    EtcdRevisionId& revision_id) {
+    char* err_msg = nullptr;
+    GoInt64 revision = 0;
+    const int ret = EtcdStoreCreateWithLeasePriorityWrapper(
+        const_cast<char*>(key.data()), key.size(),
+        const_cast<char*>(value.data()), value.size(), lease_id,
+        const_cast<char*>(candidate_prefix.data()), candidate_prefix.size(),
+        const_cast<char*>(candidate_key.data()), candidate_key.size(),
+        candidate_lease, candidate_revision, &revision, &err_msg);
+    if (err_msg) free(err_msg);
+    if (ret == -2) return ErrorCode::ETCD_TRANSACTION_FAIL;
+    if (ret != 0) return ErrorCode::ETCD_OPERATION_ERROR;
+    revision_id = revision;
+    return ErrorCode::OK;
+}
+
 ErrorCode EtcdHelper::AcquireMaintenanceSession(
     std::string_view key, int64_t lease_ttl, int64_t& session_handle,
     EtcdLeaseId& lease_id, EtcdRevisionId& create_revision) {
@@ -561,6 +581,13 @@ ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
     (void)etcd_endpoints;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::CreateWithLeaseIfFirstCandidate(
+    std::string_view, std::string_view, EtcdLeaseId,
+    std::string_view, std::string_view, EtcdLeaseId, EtcdRevisionId,
+    EtcdRevisionId&) {
+    return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
 }
 
 ErrorCode EtcdHelper::AcquireMaintenanceSession(

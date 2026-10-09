@@ -63,6 +63,10 @@ class StandbyController {
 
     virtual MasterRuntimeState GetStandbyRuntimeState() const = 0;
 
+    virtual bool IsReadyToCampaign() const {
+        return GetStandbyRuntimeState() == MasterRuntimeState::kStandby;
+    }
+
     virtual void SetStandbyRuntimeStateCallback(
         RuntimeStateCallback callback) = 0;
 };

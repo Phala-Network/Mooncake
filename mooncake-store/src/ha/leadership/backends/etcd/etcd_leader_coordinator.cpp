@@ -141,9 +141,31 @@ EtcdLeaderCoordinator::EtcdLeaderCoordinator(const HABackendSpec& spec)
     : spec_(spec),
       master_view_key_(
           BuildMasterViewKey(ResolveClusterNamespace(spec.cluster_namespace))) {
+    if (spec_.candidate_priority != 0) {
+        candidate_prefix_ = master_view_key_ + "-candidates/";
+        const auto number = std::to_string(spec_.candidate_priority);
+        candidate_key_ = candidate_prefix_ + std::string(10 - number.size(), '0') + number;
+    }
 }
 
-EtcdLeaderCoordinator::~EtcdLeaderCoordinator() { ShutdownKeepAliveThread(); }
+EtcdLeaderCoordinator::~EtcdLeaderCoordinator() {
+    (void)UpdateCandidateEligibility(false);
+    ShutdownKeepAliveThread();
+}
+
+ErrorCode EtcdLeaderCoordinator::UpdateCandidateEligibility(bool eligible) {
+    if (candidate_key_.empty()) return ErrorCode::OK;
+    if (candidate_session_ != 0) {
+        const auto alive = EtcdHelper::MaintenanceSessionAlive(candidate_session_);
+        if (eligible && alive && *alive) return ErrorCode::OK;
+        // Even after connection reset, old registration expires under its lease.
+        (void)EtcdHelper::CloseMaintenanceSession(candidate_session_);
+        candidate_session_ = 0;
+    }
+    if (!eligible) return ErrorCode::OK;
+    return EtcdHelper::AcquireMaintenanceSession(
+        candidate_key_, 10, candidate_session_, candidate_lease_, candidate_revision_);
+}
 
 ErrorCode EtcdLeaderCoordinator::Connect() {
     if (connected_) {
@@ -197,6 +219,10 @@ EtcdLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
         return tl::make_unexpected(err);
     }
 
+    if (!candidate_key_.empty() && candidate_session_ == 0) {
+        return AcquireLeadershipResult{};
+    }
+
     EtcdLeaseId lease_id = 0;
     err = EtcdHelper::GrantLease(DEFAULT_MASTER_VIEW_LEASE_TTL_SEC, lease_id);
     if (err != ErrorCode::OK) {
@@ -205,9 +231,15 @@ EtcdLeaderCoordinator::TryAcquireLeadership(const std::string& leader_address) {
     }
 
     ViewVersionId view_version = 0;
-    err = EtcdHelper::CreateWithLease(
-        master_view_key_.c_str(), master_view_key_.size(),
-        leader_address.c_str(), leader_address.size(), lease_id, view_version);
+    if (candidate_key_.empty()) {
+        err = EtcdHelper::CreateWithLease(
+            master_view_key_.c_str(), master_view_key_.size(),
+            leader_address.c_str(), leader_address.size(), lease_id, view_version);
+    } else {
+        err = EtcdHelper::CreateWithLeaseIfFirstCandidate(
+            master_view_key_, leader_address, lease_id, candidate_prefix_,
+            candidate_key_, candidate_lease_, candidate_revision_, view_version);
+    }
     if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
         auto revoke_err = EtcdHelper::RevokeLease(lease_id);
         if (revoke_err != ErrorCode::OK) {

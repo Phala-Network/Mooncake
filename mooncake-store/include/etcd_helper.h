@@ -69,6 +69,11 @@ class EtcdHelper {
                                                int64_t& session_handle,
                                                EtcdLeaseId& lease_id,
                                                EtcdRevisionId& create_revision);
+    static ErrorCode CreateWithLeaseIfFirstCandidate(
+        std::string_view key, std::string_view value, EtcdLeaseId lease_id,
+        std::string_view candidate_prefix, std::string_view candidate_key,
+        EtcdLeaseId candidate_lease, EtcdRevisionId candidate_revision,
+        EtcdRevisionId& revision_id);
     static ErrorCode CloseMaintenanceSession(int64_t session_handle);
     static tl::expected<bool, ErrorCode> MaintenanceSessionAlive(
         int64_t session_handle);

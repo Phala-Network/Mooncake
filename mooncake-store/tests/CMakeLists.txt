@@ -310,6 +310,7 @@ add_ha_test(oplog_batch_codec_test ha/oplog/oplog_batch_codec_test.cpp)
 add_ha_test(oplog_batch_standby_reader_test
             ha/oplog/oplog_batch_standby_reader_test.cpp)
 add_ha_test(ordered_oplog_writer_test ha/oplog/ordered_oplog_writer_test.cpp)
+add_ha_test(etcd_priority_test ha/leadership/etcd_priority_test.cpp)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # SimpleExecutor's IO executor calls libaio directly in coroutine tests.
   target_link_libraries(ordered_oplog_writer_test PRIVATE aio)

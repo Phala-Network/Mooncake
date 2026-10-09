@@ -19,6 +19,7 @@ class EtcdLeaderCoordinator final : public LeaderCoordinator {
     ~EtcdLeaderCoordinator() override;
 
     ErrorCode Connect();
+    ErrorCode UpdateCandidateEligibility(bool eligible) override;
 
     tl::expected<std::optional<MasterView>, ErrorCode> ReadCurrentView()
         override;
@@ -59,6 +60,11 @@ class EtcdLeaderCoordinator final : public LeaderCoordinator {
     HABackendSpec spec_;
     std::string master_view_key_;
     bool connected_ = false;
+    std::string candidate_prefix_;
+    std::string candidate_key_;
+    int64_t candidate_session_ = 0;
+    EtcdLeaseId candidate_lease_ = 0;
+    EtcdRevisionId candidate_revision_ = 0;
 
     std::mutex keepalive_mutex_;
     std::thread keepalive_thread_;

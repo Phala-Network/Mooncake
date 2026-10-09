@@ -488,6 +488,43 @@ func EtcdStoreCreateWithLeaseWrapper(key *C.char, keySize C.int, value *C.char, 
 	}
 }
 
+//export EtcdStoreCreateWithLeasePriorityWrapper
+func EtcdStoreCreateWithLeasePriorityWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.int,
+	leaseId int64, prefix *C.char, prefixSize C.int, candidate *C.char, candidateSize C.int,
+	candidateLease int64, candidateRevision int64, revisionId *int64, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	k, v := C.GoStringN(key, keySize), C.GoStringN(value, valueSize)
+	p, c := C.GoStringN(prefix, prefixSize), C.GoStringN(candidate, candidateSize)
+	if p == "" || !strings.HasPrefix(c, p) || c <= p || candidateLease == 0 || candidateRevision <= 0 {
+		*errMsg = C.CString("invalid priority candidate")
+		return -1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// One transaction fences both the live registration and every smaller
+	// priority. A separate prefix read followed by CAS would leave a race.
+	resp, err := cli.Txn(ctx).If(
+		clientv3.Compare(clientv3.CreateRevision(k), "=", 0),
+		clientv3.Compare(clientv3.CreateRevision(c), "=", candidateRevision),
+		clientv3.Compare(clientv3.Value(c), "=", strconv.FormatInt(candidateLease, 10)),
+		clientv3.Compare(clientv3.CreateRevision(p), "=", 0).WithRange(c),
+	).Then(clientv3.OpPut(k, v, clientv3.WithLease(clientv3.LeaseID(leaseId)))).Commit()
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if !resp.Succeeded {
+		*errMsg = C.CString("priority candidate contended or expired")
+		return -2
+	}
+	*revisionId = resp.Header.Revision
+	return 0
+}
+
 //export EtcdStoreAcquireMaintenanceSessionWrapper
 func EtcdStoreAcquireMaintenanceSessionWrapper(key *C.char, keySize C.int, ttl int64,
 	sessionHandle *int64, leaseId *int64, createRevision *int64, errMsg **C.char) int {

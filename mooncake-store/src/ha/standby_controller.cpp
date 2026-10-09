@@ -397,6 +397,16 @@ class CapabilityDrivenStandbyController final : public StandbyController {
                                       observed_leader, capabilities_);
     }
 
+    bool IsReadyToCampaign() const override {
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            if (!standby_running_) return false;
+        }
+        const auto status = standby_service_->GetSyncStatus();
+        return status.state == StandbyState::WATCHING && !status.is_recovering &&
+               status.lag_entries == 0;
+    }
+
     void SetStandbyRuntimeStateCallback(
         RuntimeStateCallback callback) override {
         {

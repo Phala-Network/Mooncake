@@ -83,6 +83,9 @@ struct HABackendSpec {
     HABackendType type = HABackendType::UNKNOWN;
     std::string connstring;
     ClusterNamespace cluster_namespace;
+    // Optional non-preemptive priority among registered, eligible candidates.
+    // Zero preserves the native unordered election (including old clients).
+    uint32_t candidate_priority = 0;
 };
 
 struct MasterView {

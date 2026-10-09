@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <charconv>
 #include <csignal>
 #include <cstdlib>
 #include <memory>
@@ -76,10 +77,20 @@ tl::expected<HABackendSpec, ErrorCode> BuildHABackendSpec(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    uint32_t priority = 0;
+    if (const char* value = std::getenv("MC_MASTER_PRIORITY")) {
+        const std::string_view text(value);
+        const auto parsed = std::from_chars(text.data(), text.data() + text.size(), priority);
+        if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+            priority == 0 || backend_type.value() != HABackendType::ETCD) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
     return HABackendSpec{
         .type = backend_type.value(),
         .connstring = connstring,
         .cluster_namespace = config.cluster_id,
+        .candidate_priority = priority,
     };
 }
 
@@ -268,6 +279,13 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         std::optional<LeadershipSession> leadership_session;
 
         while (!leadership_session.has_value()) {
+            auto eligibility_error = leader_coordinator.UpdateCandidateEligibility(
+                standby_controller->IsReadyToCampaign());
+            if (eligibility_error != ErrorCode::OK) {
+                if (HandleSupervisorError("register eligible candidate", eligibility_error,
+                                          spec.type)) return -1;
+                break;
+            }
             SetRuntimeState(admin_server, MasterRuntimeState::kCandidate);
 
             auto current_view = leader_coordinator.ReadCurrentView();

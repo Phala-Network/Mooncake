@@ -22,6 +22,10 @@ class LeaderCoordinator {
    public:
     virtual ~LeaderCoordinator() = default;
 
+    virtual ErrorCode UpdateCandidateEligibility(bool /*eligible*/) {
+        return ErrorCode::OK;
+    }
+
     virtual tl::expected<std::optional<MasterView>, ErrorCode>
     ReadCurrentView() = 0;
 
