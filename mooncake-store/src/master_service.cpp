@@ -4714,6 +4714,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    if (enable_oplog_ && ordered_oplog_writer_ &&
+        !ordered_oplog_writer_->IsAccepting()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -4771,6 +4775,17 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         }
         LOG(ERROR) << "key=" << key << ", error=no_primary_write_in_progress";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
+    // Reserve before making the write visible. A full queue must not turn a
+    // successful PutEnd into an unlogged metadata update on the leader.
+    std::optional<OrderedOpLogWriter::Reservation> put_end_reservation;
+    if (enable_oplog_ && ordered_oplog_writer_) {
+        auto reserved = ReserveBatchOpLogSlot();
+        if (!reserved) {
+            return tl::make_unexpected(reserved.error());
+        }
+        put_end_reservation.emplace(std::move(reserved.value()));
     }
 
     const bool had_completed_replica =
@@ -4852,13 +4867,13 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     metadata.GrantReadLease(0);
     PublishKvStored(key, replica_type, metadata, object_id.tenant_id);
 
-    if (enable_oplog_ && ordered_oplog_writer_) {
+    if (put_end_reservation.has_value()) {
         std::string payload = SerializeMetadataForOpLog(metadata);
-        auto result = AppendOpLogVisibleBeforeDurable(
-            OpType::PUT_END, object_id.tenant_id.value(), key, payload);
+        auto result = AppendReservedOpLogWithDurableFinalize(
+            std::move(put_end_reservation.value()), OpType::PUT_END,
+            object_id.tenant_id.value(), key, payload, nullptr);
         if (!result) {
-            LOG(WARNING) << "PutEnd: OpLog queue failed for key=" << key
-                         << ", err=" << static_cast<int>(result.error());
+            return tl::make_unexpected(result.error());
         }
     }
     return {};
@@ -5117,9 +5132,25 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     assert(tenant_id.IsValid());
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(object_metas.size());
+    auto retry_budget = std::chrono::milliseconds(2000);
     for (const auto& object_meta : object_metas) {
-        results.emplace_back(
-            PutEnd(client_id, object_meta, tenant_id, replica_type));
+        auto result = PutEnd(client_id, object_meta, tenant_id, replica_type);
+        auto retry_delay = std::chrono::milliseconds(1);
+        while (!result &&
+               result.error() == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED &&
+               retry_budget.count() > 0) {
+            const auto delay = std::min(retry_delay, retry_budget);
+            const auto before = std::chrono::steady_clock::now();
+            std::this_thread::sleep_for(delay);
+            result = PutEnd(client_id, object_meta, tenant_id, replica_type);
+            const auto elapsed =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - before);
+            retry_budget -= std::max(delay, elapsed);
+            retry_delay = std::min(retry_delay * 2,
+                                   std::chrono::milliseconds(50));
+        }
+        results.emplace_back(std::move(result));
     }
     return results;
 }

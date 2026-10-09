@@ -3930,6 +3930,92 @@ TEST_F(MasterServiceHATest, SSDRegistrationDoesNotRetryStoppedWriter) {
               std::chrono::milliseconds(500));
 }
 
+TEST_F(MasterServiceHATest, PutEndBackpressurePreservesProcessingReplica) {
+    const std::string cluster_id = "put_end_backpressure";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build());
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto mounted = PrepareSimpleSegment(service, "put_end_backpressure_seg");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_TRUE(service.PutStart(mounted.client_id, "pending-"+std::to_string(i),
+                                     kDefaultTenant, 1024, config).has_value());
+    }
+    backend->BlockTxn();
+    EXPECT_TRUE(service.PutEnd(mounted.client_id, "pending-0", kDefaultTenant,
+                               ReplicaType::MEMORY).has_value());
+    EXPECT_TRUE(service.PutEnd(mounted.client_id, "pending-1", kDefaultTenant,
+                               ReplicaType::MEMORY).has_value());
+    auto rejected = service.PutEnd(mounted.client_id, "pending-2", kDefaultTenant,
+                                   ReplicaType::MEMORY);
+    auto unreadable = service.GetReplicaList("pending-2", kDefaultTenant);
+    backend->AllowTxn();
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, rejected.error());
+    ASSERT_FALSE(unreadable.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, unreadable.error());
+    auto completed = service.BatchPutEnd(mounted.client_id,
+        {ObjectMeta{"pending-2", std::nullopt}}, kDefaultTenant, ReplicaType::MEMORY);
+    ASSERT_TRUE(completed[0].has_value());
+    StopOpLogWriter(service);
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(4u, prefix.last_seq);
+    EXPECT_TRUE(service.GetReplicaList("pending-2", kDefaultTenant).has_value());
+}
+
+TEST_F(MasterServiceHATest, BatchPutEndDrainsWithoutDroppingOpLogEntries) {
+    const std::string cluster_id = "batch_put_end_backpressure";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1024)
+                              .build());
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto mounted = PrepareSimpleSegment(service, "batch_put_end_backpressure_seg");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    std::vector<ObjectMeta> objects;
+    for (int i = 0; i < 5000; ++i) {
+        const auto key = "pending-batch-"+std::to_string(i);
+        ASSERT_TRUE(service.PutStart(mounted.client_id, key, kDefaultTenant,
+                                     1024, config).has_value());
+        objects.push_back(ObjectMeta{key, std::nullopt});
+    }
+    backend->BlockTxn();
+    auto pending = std::async(std::launch::async, [&] {
+        return service.BatchPutEnd(mounted.client_id, objects, kDefaultTenant,
+                                    ReplicaType::MEMORY);
+    });
+    EXPECT_EQ(std::future_status::timeout,
+              pending.wait_for(std::chrono::milliseconds(100)));
+    backend->AllowTxn();
+    auto results = pending.get();
+    ASSERT_EQ(objects.size(), results.size());
+    for (const auto& result : results) ASSERT_TRUE(result.has_value());
+    StopOpLogWriter(service);
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(5001u, prefix.last_seq);
+    for (const auto& object : objects) {
+        EXPECT_TRUE(service.GetReplicaList(object.key, kDefaultTenant).has_value());
+    }
+}
+
 TEST_F(MasterServiceHATest, SegmentLifecycleWritesBatchRecordOpLogs) {
     const std::string cluster_id = "test_batch_record_segment_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();

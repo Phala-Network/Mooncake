@@ -34,3 +34,11 @@ bucket files compatible without enlarging the queue or changing durability.
 Qualify this path with more than one queue's worth of persisted objects. The HA
 tests cover a 20,000-object batch, bounded permanent saturation, and a stopped
 writer; production rollout still requires real old-owner SSD recovery.
+
+PutEnd also reserves OpLog capacity before completing a replica. Queue rejection
+leaves it PROCESSING and returns an error rather than silently acknowledging an
+unlogged update. BatchPutEnd shares a bounded two-second retry budget outside
+metadata locks. A stopped/failing writer rejects even idempotent completion
+retries; successful completion retains the existing visible-before-durable
+contract. Tests check both rejected replica state and a 5,000-object batch's
+complete durable sequence.
