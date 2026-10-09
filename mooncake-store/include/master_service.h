@@ -475,6 +475,13 @@ class MasterService {
                   const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
+    // Preserve input order and share one bounded backpressure budget per RPC.
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
+                  const TenantId& tenant_id,
+                  const std::vector<uint64_t>& slice_lengths,
+                  const ReplicateConfig& config);
+
     /**
      * @brief Complete a put operation, replica_type indicates the type of
      * replica to complete (memory or disk)

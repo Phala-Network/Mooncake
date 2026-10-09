@@ -3930,6 +3930,105 @@ TEST_F(MasterServiceHATest, SSDRegistrationDoesNotRetryStoppedWriter) {
               std::chrono::milliseconds(500));
 }
 
+TEST_F(MasterServiceHATest, BatchPutStartWaitsForCleanupBackpressure) {
+    const std::string cluster_id = "BatchPutStartWaitsForCleanupBackpressure";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .set_put_start_discard_timeout_sec(1)
+                              .set_put_start_release_timeout_sec(60)
+                              .build());
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto mounted = PrepareSimpleSegment(service, "batch_start_pressure_seg");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.prefer_alloc_in_same_node = true;
+    std::vector<std::string> keys;
+    std::vector<uint64_t> sizes(16, 1024);
+    for (int i = 0; i < 16; ++i) keys.push_back("expired-"+std::to_string(i));
+    const auto original = service.BatchPutStart(mounted.client_id, keys,
+                                                kDefaultTenant, sizes, config);
+    for (const auto& result : original) ASSERT_TRUE(result.has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    backend->BlockTxn();
+    const auto begin = std::chrono::steady_clock::now();
+    auto pending = std::async(std::launch::async, [&] {
+        return service.BatchPutStart(mounted.client_id, keys, kDefaultTenant,
+                                     sizes, config);
+    });
+    EXPECT_EQ(std::future_status::timeout,
+              pending.wait_for(std::chrono::milliseconds(100)));
+    backend->AllowTxn();
+    auto results = pending.get();
+    ASSERT_EQ(keys.size(), results.size());
+    for (const auto& result : results) ASSERT_TRUE(result.has_value());
+    StopOpLogWriter(service);
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(17u, prefix.last_seq);
+    auto invalid = service.BatchPutStart(mounted.client_id, keys, kDefaultTenant,
+                                         {1024}, config);
+    for (const auto& result : invalid) {
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    }
+}
+
+TEST_F(MasterServiceHATest, BatchPutStartSharesFiniteCleanupBudget) {
+    const std::string cluster_id = "BatchPutStartSharesFiniteCleanupBudget";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .set_put_start_discard_timeout_sec(1)
+                              .set_put_start_release_timeout_sec(60)
+                              .build());
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto mounted = PrepareSimpleSegment(service, "batch_start_pressure_seg");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.prefer_alloc_in_same_node = true;
+    std::vector<std::string> keys;
+    std::vector<uint64_t> sizes(16, 1024);
+    for (int i = 0; i < 16; ++i) keys.push_back("expired-"+std::to_string(i));
+    const auto original = service.BatchPutStart(mounted.client_id, keys,
+                                                kDefaultTenant, sizes, config);
+    for (const auto& result : original) ASSERT_TRUE(result.has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    backend->BlockTxn();
+    const auto begin = std::chrono::steady_clock::now();
+    auto pending = std::async(std::launch::async, [&] {
+        return service.BatchPutStart(mounted.client_id, keys, kDefaultTenant,
+                                     sizes, config);
+    });
+    const auto status = pending.wait_for(std::chrono::seconds(4));
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    backend->AllowTxn();
+    const auto results = pending.get();
+    ASSERT_EQ(std::future_status::ready, status);
+    EXPECT_LT(elapsed, std::chrono::seconds(4));
+    size_t rejected = 0;
+    for (const auto& result : results) {
+        if (!result) {
+            EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, result.error());
+            ++rejected;
+        }
+    }
+    EXPECT_GT(rejected, 0u);
+    StopOpLogWriter(service);
+}
+
 TEST_F(MasterServiceHATest, PutEndBackpressurePreservesProcessingReplica) {
     const std::string cluster_id = "put_end_backpressure";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();

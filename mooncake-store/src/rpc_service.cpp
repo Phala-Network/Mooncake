@@ -457,52 +457,12 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     auto resolved_tenant_id = ResolveTenantIdForWrite(
         tenant_id, master_service_.IsTenantQuotaEnabled());
 
-    if (keys.size() != slice_lengths.size()) {
-        LOG(ERROR) << "BatchPutStart: keys.size()=" << keys.size()
-                   << " != slice_lengths.size()=" << slice_lengths.size();
-        results.assign(keys.size(),
-                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-    } else if (config.group_ids.has_value() &&
-               config.group_ids->size() != keys.size()) {
-        LOG(ERROR) << "BatchPutStart: group_ids.size()="
-                   << config.group_ids->size()
-                   << " != keys.size()=" << keys.size();
-        results.assign(keys.size(),
-                       tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-    } else if (!resolved_tenant_id) {
+    if (!resolved_tenant_id) {
         results.assign(keys.size(),
                        tl::make_unexpected(resolved_tenant_id.error()));
-    } else if (config.prefer_alloc_in_same_node) {
-        ReplicateConfig new_config = config;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            auto key_config = new_config.ForSingleKey(i);
-            auto result = master_service_.PutStart(
-                client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], key_config);
-            results.emplace_back(result);
-            if ((i == 0) && result.has_value()) {
-                std::string preferred_segment;
-                for (const auto& replica : result.value()) {
-                    if (replica.is_memory_replica()) {
-                        auto handles =
-                            replica.get_memory_descriptor().buffer_descriptor;
-                        if (!handles.transport_endpoint_.empty()) {
-                            preferred_segment = handles.transport_endpoint_;
-                        }
-                    }
-                }
-                if (!preferred_segment.empty()) {
-                    new_config.preferred_segment = preferred_segment;
-                }
-            }
-        }
     } else {
-        for (size_t i = 0; i < keys.size(); ++i) {
-            auto key_config = config.ForSingleKey(i);
-            results.emplace_back(master_service_.PutStart(
-                client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], key_config));
-        }
+        results = master_service_.BatchPutStart(
+            client_id, keys, resolved_tenant_id.value(), slice_lengths, config);
     }
 
     size_t failure_count = 0;

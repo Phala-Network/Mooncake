@@ -4711,6 +4711,63 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
 
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+MasterService::BatchPutStart(const UUID& client_id,
+                             const std::vector<std::string>& keys,
+                             const TenantId& tenant_id,
+                             const std::vector<uint64_t>& slice_lengths,
+                             const ReplicateConfig& config) {
+    assert(tenant_id.IsValid());
+    using Result = tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    if (keys.size() != slice_lengths.size() ||
+        (config.group_ids && config.group_ids->size() != keys.size())) {
+        return std::vector<Result>(
+            keys.size(), tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    std::vector<Result> results;
+    results.reserve(keys.size());
+    ReplicateConfig next_config = config;
+    auto retry_budget = std::chrono::milliseconds(2000);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto key_config = next_config.ForSingleKey(i);
+        auto attempt = [&] {
+            return PutStart(client_id, keys[i], tenant_id, slice_lengths[i],
+                            key_config);
+        };
+        auto result = attempt();
+        auto retry_delay = std::chrono::milliseconds(1);
+        // PutStart has released metadata/snapshot locks before waiting. Only
+        // queue admission failures are retryable; never repeat a successful
+        // allocation or hide an unrelated error.
+        while (!result &&
+               result.error() == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED &&
+               retry_budget.count() > 0) {
+            const auto delay = std::min(retry_delay, retry_budget);
+            const auto before = std::chrono::steady_clock::now();
+            std::this_thread::sleep_for(delay);
+            result = attempt();
+            const auto elapsed =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - before);
+            retry_budget -= std::max(delay, elapsed);
+            retry_delay = std::min(retry_delay * 2,
+                                   std::chrono::milliseconds(50));
+        }
+        if (i == 0 && config.prefer_alloc_in_same_node && result) {
+            for (const auto& replica : result.value()) {
+                if (replica.is_memory_replica()) {
+                    const auto& endpoint = replica.get_memory_descriptor()
+                                               .buffer_descriptor
+                                               .transport_endpoint_;
+                    if (!endpoint.empty()) next_config.preferred_segment = endpoint;
+                }
+            }
+        }
+        results.emplace_back(std::move(result));
+    }
+    return results;
+}
+
 auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
