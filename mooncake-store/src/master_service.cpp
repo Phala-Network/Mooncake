@@ -3364,9 +3364,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                         object.tenant_id, object.user_key));
                 (void)inserted;
                 if (!standby_meta.group_id.empty()) {
-                    it->second.lease_ =
-                        RegisterGroupMember(object.tenant_id, object.user_key,
-                                            standby_meta.group_id);
+                    RegisterGroupMember(tenant_state, object.tenant_id,
+                                        object.user_key, standby_meta.group_id);
                 }
                 tenant_state.processing_keys.erase(object.user_key);
             }
