@@ -23,6 +23,8 @@ RUN git clone --branch 1.11.908 --depth 1 --recurse-submodules https://github.co
 COPY . /src
 RUN git clone https://github.com/pybind/pybind11.git /src/extern/pybind11 \
     && git -C /src/extern/pybind11 checkout 58c382a8e3d7081364d2f5c62e7f429f0412743b
+RUN apt-get update -qq && apt-get install -y --no-install-recommends libmsgpack-dev \
+    && rm -rf /var/lib/apt/lists/*
 RUN cmake -S /src -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_PREFIX_PATH=/opt/ha-deps -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DENABLE_DEBUG_SYMBOLS=OFF -DUSE_CUDA=OFF -DUSE_TENT=OFF \

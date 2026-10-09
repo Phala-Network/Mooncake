@@ -361,6 +361,10 @@ target_link_libraries(
           Mooncake::xxhash
           asio_shared
           yalantinglibs::yalantinglibs)
+if(HAVE_AWS_SDK)
+  target_link_libraries(mooncake_store_master_objects
+                        PRIVATE ${AWSSDK_LINK_LIBRARIES})
+endif()
 if(KV_EVENTS_ZMQ_FOUND)
   target_compile_definitions(mooncake_store_master_objects
                              PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
