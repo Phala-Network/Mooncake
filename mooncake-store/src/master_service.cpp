@@ -7579,6 +7579,11 @@ auto MasterService::NotifyOffloadSuccess(
     // below). NACK cleanups still run for the rest of the batch; the caller
     // gets SEGMENT_NOT_FOUND so a rescan stops re-registering.
     bool refused_unmounted = false;
+    // A ScanMeta RPC can contain many more objects than the bounded OpLog
+    // queue. Let its writer drain without holding metadata/snapshot locks.
+    // Bound total backpressure time per RPC; persistent failure must remain
+    // visible to the owner rather than tying up an RPC worker indefinitely.
+    auto retry_budget = std::chrono::milliseconds(2000);
 
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& task = tasks[i];
@@ -7710,6 +7715,22 @@ auto MasterService::NotifyOffloadSuccess(
 
             auto res = AddReplica(client_id, object_id.user_key,
                                   object_id.tenant_id, replica);
+            auto retry_delay = std::chrono::milliseconds(1);
+            while (!res &&
+                   res.error() == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED &&
+                   retry_budget.count() > 0) {
+                const auto delay = std::min(retry_delay, retry_budget);
+                const auto before = std::chrono::steady_clock::now();
+                std::this_thread::sleep_for(delay);
+                res = AddReplica(client_id, object_id.user_key,
+                                 object_id.tenant_id, replica);
+                const auto elapsed =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - before);
+                retry_budget -= std::max(delay, elapsed);
+                retry_delay = std::min(retry_delay * 2,
+                                       std::chrono::milliseconds(50));
+            }
             if (!res) {
                 if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
                     continue;

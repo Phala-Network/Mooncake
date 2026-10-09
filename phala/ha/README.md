@@ -23,3 +23,14 @@ learner/catch-up/promote, preserving member and cluster IDs. Existing client
 builds do not automatically synchronize new endpoint lists; qualify and maintain
 a stable local proxy endpoint before removing original members. Snapshot storage
 must have independently qualified replica placement and availability.
+
+SSD metadata restoration may send 20,000 objects in one ScanMeta RPC while the
+OpLog waiting queue defaults to 1,024 entries. Offload registration retries only
+queue-capacity backpressure, outside metadata/snapshot locks, with at most two
+seconds of accumulated retry time per RPC. Other errors propagate immediately;
+persistent backpressure still fails explicitly. This keeps existing owners and
+bucket files compatible without enlarging the queue or changing durability.
+
+Qualify this path with more than one queue's worth of persisted objects. The HA
+tests cover a 20,000-object batch, bounded permanent saturation, and a stopped
+writer; production rollout still requires real old-owner SSD recovery.

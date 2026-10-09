@@ -306,6 +306,10 @@ class MasterServiceHATest : public ::testing::Test {
         return service.enable_oplog_;
     }
 
+    static void StopOpLogWriter(MasterService& service) {
+        service.ordered_oplog_writer_->Stop();
+    }
+
     static bool HasBatchOpLogStorage(const MasterService& service) {
         return service.batch_oplog_storage_ != nullptr;
     }
@@ -3828,6 +3832,102 @@ TEST_F(MasterServiceHATest,
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
+}
+
+TEST_F(MasterServiceHATest, LargeSSDRegistrationWaitsForOpLogCapacity) {
+    const std::string cluster_id = "ssd_registration_backpressure";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1024)
+                              .build());
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    std::vector<OffloadTaskItem> tasks;
+    std::vector<StorageObjectMetadata> metadatas;
+    for (int i = 0; i < 20000; ++i) {
+        tasks.push_back({.tenant_id = kDefaultTenant.value(),
+                         .key = "ssd-large-" + std::to_string(i),
+                         .size = 1024});
+        StorageObjectMetadata metadata;
+        metadata.data_size = 1024;
+        metadata.transport_endpoint = "ssd-large-owner";
+        metadatas.push_back(metadata);
+    }
+    backend->BlockTxn();
+    const auto client_id = generate_uuid();
+    auto pending = std::async(std::launch::async, [&] {
+        return service.NotifyOffloadSuccess(client_id, tasks, metadatas);
+    });
+    EXPECT_EQ(std::future_status::timeout,
+              pending.wait_for(std::chrono::milliseconds(100)));
+    backend->AllowTxn();
+    ASSERT_TRUE(pending.get().has_value());
+    StopOpLogWriter(service);
+    OpLogBatchStorage storage(cluster_id, *backend);
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
+    EXPECT_EQ(20000u, prefix.last_seq);
+    for (const auto& task : tasks) {
+        auto replicas = service.GetReplicaList(task.key, kDefaultTenant);
+        ASSERT_TRUE(replicas.has_value());
+        ASSERT_EQ(1u, replicas->replicas.size());
+        EXPECT_TRUE(replicas->replicas[0].is_local_disk_replica());
+    }
+}
+
+TEST_F(MasterServiceHATest, SSDRegistrationBackpressureHasFiniteBudget) {
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id("ssd_registration_timeout")
+                              .set_oplog_batch_max_entries(1)
+                              .build());
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    std::vector<OffloadTaskItem> tasks;
+    std::vector<StorageObjectMetadata> metadatas;
+    for (int i = 0; i < 4; ++i) {
+        tasks.push_back({.tenant_id = kDefaultTenant.value(),
+                         .key = "ssd-blocked-" + std::to_string(i),
+                         .size = 1024});
+        StorageObjectMetadata metadata;
+        metadata.data_size = 1024;
+        metadata.transport_endpoint = "ssd-blocked-owner";
+        metadatas.push_back(metadata);
+    }
+    backend->BlockTxn();
+    const auto started = std::chrono::steady_clock::now();
+    auto result = service.NotifyOffloadSuccess(generate_uuid(), tasks, metadatas);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    backend->AllowTxn();  // Always release the writer before assertions/teardown.
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, result.error());
+    EXPECT_GE(elapsed, std::chrono::milliseconds(1900));
+    EXPECT_LT(elapsed, std::chrono::seconds(4));
+}
+
+TEST_F(MasterServiceHATest, SSDRegistrationDoesNotRetryStoppedWriter) {
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id("ssd_registration_stopped")
+                              .build());
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    StopOpLogWriter(service);
+    OffloadTaskItem task{.tenant_id = kDefaultTenant.value(),
+                         .key = "ssd-stopped", .size = 1024};
+    StorageObjectMetadata metadata;
+    metadata.data_size = 1024;
+    metadata.transport_endpoint = "ssd-stopped-owner";
+    const auto started = std::chrono::steady_clock::now();
+    auto result = service.NotifyOffloadSuccess(generate_uuid(), {task}, {metadata});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, result.error());
+    EXPECT_LT(std::chrono::steady_clock::now() - started,
+              std::chrono::milliseconds(500));
 }
 
 TEST_F(MasterServiceHATest, SegmentLifecycleWritesBatchRecordOpLogs) {
