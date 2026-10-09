@@ -1042,6 +1042,71 @@ TEST_F(MasterServiceHATest, BatchPromotionDrainsMultipleChunksAndPreservesIds) {
     EXPECT_EQ(second_descriptors.front().id, 42);
 }
 
+TEST_F(MasterServiceHATest, BatchPromotionPreservesGroupedRoutesAcrossChunks) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const std::string endpoint = "grouped_batch_promotion_segment";
+    const std::string key = "shared_key";
+    const std::string group = FindGroupIdOnDifferentShardFromObject(
+        service, kDefaultTenant, key, "batch-group-");
+    ASSERT_FALSE(group.empty());
+
+    auto first = MakeStandbyObject(key, endpoint);
+    auto second = MakeStandbyObject("second_key", endpoint);
+    auto other_tenant = MakeStandbyObject(key, endpoint);
+    other_tenant.tenant_id = "other-tenant";
+    std::vector<StandbyObjectEntry> entries{first, second, other_tenant};
+    auto source = std::make_unique<StandbyMetadataStore>();
+    for (size_t i = 0; i < entries.size(); ++i) {
+        auto& entry = entries[i];
+        entry.metadata.group_id = group;
+        auto& replica = entry.metadata.replicas.front();
+        replica.id = 71 + i;
+        replica.get_memory_descriptor().buffer_descriptor.buffer_address_ =
+            kDefaultSegmentBase + i * 4096;
+        ASSERT_TRUE(source->PutMetadata(entry.tenant_id, entry.key,
+                                        entry.metadata));
+    }
+    BatchOpLogPromotionHandoff handoff;
+    handoff.metadata_store = std::move(source);
+    handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    handoff.applied_cursor = {.batch_id = 7, .last_seq = 7};
+    handoff.max_replica_id = 73;
+
+    // One object per chunk forces both same-group members through separate
+    // drains. Accessors resolve the stable tenant/key -> group shard route.
+    ASSERT_TRUE(service.RestoreFromBatchOpLogPromotion(std::move(handoff), 1)
+                    .has_value());
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const auto& entry = entries[i];
+        auto replicas = ReplicaDescriptorsForTesting(
+            service, TenantId(entry.tenant_id), entry.key);
+        ASSERT_EQ(1u, replicas.size());
+        EXPECT_EQ(71 + i, replicas.front().id);
+    }
+    EXPECT_FALSE(HasMetadataEntryForTesting(
+        service, TenantId("other-tenant"), second.key));
+
+    // A restored grouped key cannot be duplicated into another group shard.
+    auto duplicate = entries.front();
+    duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromGroup(
+        service, group, "replacement-batch-group-");
+    auto duplicate_source = std::make_unique<StandbyMetadataStore>();
+    ASSERT_TRUE(duplicate_source->PutMetadata(
+        duplicate.tenant_id, duplicate.key, duplicate.metadata));
+    BatchOpLogPromotionHandoff duplicate_handoff;
+    duplicate_handoff.metadata_store = std::move(duplicate_source);
+    duplicate_handoff.segments = {MakeStandbyMemorySegment(endpoint)};
+    duplicate_handoff.applied_cursor = {.batch_id = 8, .last_seq = 8};
+    duplicate_handoff.max_replica_id = 71;
+    auto result = service.RestoreFromBatchOpLogPromotion(
+        std::move(duplicate_handoff), 1);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_ALREADY_EXISTS, result.error());
+    EXPECT_EQ(1u, ReplicaCountForTesting(service, kDefaultTenant, key));
+    EXPECT_EQ(1u, ReplicaCountForTesting(service, TenantId("other-tenant"), key));
+}
+
 TEST_F(MasterServiceHATest, BatchPromotionRejectsCrossChunkOverlap) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
@@ -2329,6 +2394,72 @@ TEST_F(MasterServiceHATest, BatchExistKeyRequiresCompletedReplica) {
     EXPECT_FALSE(results[2].value());
     ASSERT_TRUE(results[3].has_value());
     EXPECT_FALSE(results[3].value());
+}
+
+TEST_F(MasterServiceHATest, DestructorJoinsTerminalCallbackAfterLocalHandlesEnd) {
+    std::promise<void> write_entered;
+    auto entered = write_entered.get_future();
+    std::promise<void> release_write;
+    auto released = release_write.get_future().share();
+    std::atomic<bool> callback_ran{false};
+    std::weak_ptr<std::atomic<bool>> terminal_lifetime;
+    std::weak_ptr<std::mutex> gate_lifetime;
+
+    auto service = std::make_unique<MasterService>(
+        MasterServiceConfig::builder()
+            .set_enable_ha(true)
+            .set_enable_oplog(true)
+            .set_cluster_id("terminal_teardown_test")
+            .set_oplog_batch_max_entries(1)
+            .build());
+    service->SetBatchOpLogWriterFactoryForTesting(
+        [&](OrderedOpLogWriterConfig config,
+            OrderedOpLogWriter::WriteBatchFn) {
+            return std::make_unique<OrderedOpLogWriter>(
+                std::move(config),
+                [&write_entered, released](const OpLogBatchRecord&,
+                                           const DurablePrefix&) {
+                    write_entered.set_value();
+                    released.wait();
+                    return ErrorCode::INVALID_PARAMS;
+                });
+        });
+    ASSERT_EQ(ErrorCode::OK, service->SetBatchOpLogBackendForTesting(
+                                 std::make_shared<FakeBatchHaKvBackend>()));
+    {
+        // Match the supervisor's early-exit lifetime: the local shared_ptr
+        // handles disappear before the service stops its pending writer.
+        auto writer_terminal = std::make_shared<std::atomic<bool>>(false);
+        auto serving_gate = std::make_shared<std::mutex>();
+        terminal_lifetime = writer_terminal;
+        gate_lifetime = serving_gate;
+        service->SetBatchOpLogTerminalCallback(
+            [writer_terminal, serving_gate, &callback_ran](const auto& state) {
+                std::lock_guard<std::mutex> lock(*serving_gate);
+                EXPECT_EQ(ErrorCode::INVALID_PARAMS, state.error);
+                EXPECT_FALSE(writer_terminal->exchange(true));
+                callback_ran.store(true);
+            });
+        auto submitted = AppendVisibleForTesting(
+            *service, OpType::REMOVE, kDefaultTenant, "teardown_key", "");
+        if (!submitted) release_write.set_value();
+        ASSERT_TRUE(submitted.has_value());
+    }
+    EXPECT_FALSE(terminal_lifetime.expired());
+    EXPECT_FALSE(gate_lifetime.expired());
+    EXPECT_EQ(std::future_status::ready,
+              entered.wait_for(std::chrono::seconds(2)));
+
+    auto teardown = std::async(std::launch::async, [&] { service.reset(); });
+    EXPECT_EQ(std::future_status::timeout,
+              teardown.wait_for(std::chrono::milliseconds(20)));
+    release_write.set_value();
+    ASSERT_EQ(std::future_status::ready,
+              teardown.wait_for(std::chrono::seconds(3)));
+    teardown.get();
+    EXPECT_TRUE(callback_ran.load());
+    EXPECT_TRUE(terminal_lifetime.expired());
+    EXPECT_TRUE(gate_lifetime.expired());
 }
 
 TEST_F(MasterServiceHATest, BatchRecordSubmissionHelpersUseOrderedWriter) {

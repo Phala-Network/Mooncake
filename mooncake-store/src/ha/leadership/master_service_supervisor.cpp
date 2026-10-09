@@ -427,8 +427,12 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             config.http_metadata_remote_url);
         auto writer_terminal = std::make_shared<std::atomic<bool>>(false);
         auto serving_gate = std::make_shared<std::mutex>();
+        // Early exits destroy these local handles before the service. Keep
+        // their state alive until its destructor stops and joins the writer.
+        // The referenced server/admin/reconciler all outlive the service.
         wrapped_master_service->SetBatchOpLogTerminalCallback(
-            [&](const OrderedOpLogWriterTerminalState& state) {
+            [writer_terminal, serving_gate, &server, &admin_server,
+             &label_reconciler](const OrderedOpLogWriterTerminalState& state) {
                 std::lock_guard<std::mutex> lock(*serving_gate);
                 if (writer_terminal->exchange(true)) return;
                 LOG(ERROR) << "Batch OpLog writer terminal: "
