@@ -117,6 +117,8 @@ set(SPDK_STATIC_LIBS "")
 # Find AWS SDK
 find_package(AWSSDK QUIET COMPONENTS s3)
 if(AWSSDK_FOUND)
+  # Static AWS SDK exports reference this imported target.
+  find_package(ZLIB REQUIRED)
   message(STATUS "AWS SDK found: ${AWSSDK_VERSION}")
   set(HAVE_AWS_SDK TRUE)
   # Add S3 related source files

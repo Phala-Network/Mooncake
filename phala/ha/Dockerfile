@@ -30,7 +30,7 @@ RUN cmake -S /src -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DWITH_STORE_RUST=OFF -DWITH_EP=OFF -DBUILD_EXAMPLES=OFF \
     -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=ON \
     && grep -q 'AWSSDK_DIR:PATH=/opt/ha-deps' /build/CMakeCache.txt
-RUN cmake --build /build --target mooncake_master -j6
+RUN cmake --build /build --target mooncake_master -j16
 # Keep the build target available for focused CPU tests; runtime is separate.
 FROM build AS tests
 
