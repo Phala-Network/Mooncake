@@ -37,6 +37,10 @@ class FakeBackend final : public HaKvBackend {
         return ErrorCode::OK;
     }
 
+    ErrorCode DeleteRange(std::string_view, std::string_view) override {
+        return ErrorCode::OK;
+    }
+
     bool SupportsTxn() const override { return true; }
     ErrorCode Txn(const KvTxn&) override { return ErrorCode::OK; }
 
