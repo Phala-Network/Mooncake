@@ -137,6 +137,10 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  * 6. ShardedTenantQuotaTable internal mutex or segment_mutex_
  * 7. soft_pin_deadline_index_ mutex
  *
+ * ReMountSegment acquires client_mutex_ and snapshot_mutex_ together with
+ * std::lock. Its retry protocol never blocks on either while retaining the
+ * other, so it does not invert the blocking acquisition order above.
+ *
  * Strict tenant admission and policy mutation paths that need both
  * tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
  * policy mutex first, then snapshot_mutex_.

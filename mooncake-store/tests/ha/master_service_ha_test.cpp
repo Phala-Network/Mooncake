@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -709,6 +710,64 @@ class MasterServiceHATest : public ::testing::Test {
         return std::unique_lock<std::shared_mutex>(service.snapshot_mutex_);
     }
 
+    static void ExpectPingWhileRemountWaitsForSnapshot(bool exclusive) {
+        MasterService service(
+            MasterServiceConfig::builder().set_enable_ha(false).build());
+        const UUID healthy_client = generate_uuid();
+        const UUID remount_client = generate_uuid();
+        ASSERT_TRUE(service.ReMountSegment({}, healthy_client).has_value());
+
+        std::unique_lock<std::shared_mutex> writer(service.snapshot_mutex_,
+                                                  std::defer_lock);
+        std::shared_lock<std::shared_mutex> reader(service.snapshot_mutex_,
+                                                  std::defer_lock);
+        if (exclusive) {
+            writer.lock();
+        } else {
+            reader.lock();
+        }
+        std::promise<void> started;
+        auto started_future = started.get_future();
+        auto remount = std::async(std::launch::async, [&] {
+            started.set_value();
+            return service.ReMountSegment({}, remount_client);
+        });
+        started_future.wait();
+        EXPECT_EQ(remount.wait_for(std::chrono::milliseconds(100)),
+                  std::future_status::timeout);
+
+        auto ping = std::async(std::launch::async, [&] {
+            return std::make_pair(service.Ping(healthy_client),
+                                  service.Ping(remount_client));
+        });
+        const bool ping_completed =
+            ping.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+        // Always release the barrier before assertions that can return, so
+        // the original convoy fails the test instead of hanging its futures.
+        if (exclusive) {
+            writer.unlock();
+        } else {
+            reader.unlock();
+        }
+        EXPECT_TRUE(ping_completed);
+        ASSERT_EQ(ping.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+        const auto responses = ping.get();
+        ASSERT_TRUE(responses.first.has_value());
+        EXPECT_EQ(responses.first->client_status, ClientStatus::OK);
+        if (ping_completed) {
+            ASSERT_TRUE(responses.second.has_value());
+            EXPECT_EQ(responses.second->client_status,
+                      ClientStatus::NEED_REMOUNT);
+        }
+        ASSERT_EQ(remount.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+        EXPECT_TRUE(remount.get().has_value());
+        const auto recovered = service.Ping(remount_client);
+        ASSERT_TRUE(recovered.has_value());
+        EXPECT_EQ(recovered->client_status, ClientStatus::OK);
+    }
+
     static std::unique_lock<SharedMutex> LockMetadataShardForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
@@ -1271,8 +1330,8 @@ TEST_F(MasterServiceHATest,
         FAIL() << "PutStart did not reach the snapshot barrier";
     }
 
-    // ReMountSegment holds client_mutex_ exclusively while waiting for the
-    // snapshot barrier. PutStart must not reacquire it inside that barrier.
+    // PutStart must not reacquire client_mutex_ inside the snapshot barrier,
+    // regardless of which client operation currently holds it.
     auto client_lock = LockClientForTesting(service);
     shard_lock.unlock();
     const bool completed_while_client_locked =
@@ -1283,6 +1342,14 @@ TEST_F(MasterServiceHATest,
     auto result = put.get();
     ASSERT_TRUE(result.has_value()) << toString(result.error());
     EXPECT_TRUE(completed_while_client_locked);
+}
+
+TEST_F(MasterServiceHATest, PingContinuesWhileRemountWaitsForCleanupBarrier) {
+    ExpectPingWhileRemountWaitsForSnapshot(/*exclusive=*/false);
+}
+
+TEST_F(MasterServiceHATest, PingContinuesWhileRemountWaitsForSnapshotWriter) {
+    ExpectPingWhileRemountWaitsForSnapshot(/*exclusive=*/true);
 }
 
 TEST_F(MasterServiceHATest, NoFBatchEvictWaitsForSnapshotBarrier) {
