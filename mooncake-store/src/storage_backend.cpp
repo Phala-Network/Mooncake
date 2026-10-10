@@ -137,6 +137,9 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
         Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS",
                           config.disk_scan_cache_ms);
 
+    config.direct_io_write = Environ::GetBool(
+        "MOONCAKE_OFFLOAD_BUCKET_DIRECT_IO_WRITE", config.direct_io_write);
+
     const auto policy_str = Environ::GetString(
         "MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY",
         Environ::GetString("MOONCAKE_BUCKET_EVICTION_POLICY", "fifo"));
@@ -1768,7 +1771,27 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
 
     // Phase 1: eviction — remove oldest buckets from metadata maps to make
     // room. Must notify master BEFORE deleting files (Phase 2).
-    const int64_t required_size = bucket->data_size + bucket->meta_size;
+    if (bucket_backend_config_.direct_io_write) {
+        // meta_size is NOT in YLT_REFL(BucketMetadata). Assigning it cannot
+        // change the bytes StoreBucketMetadata later serializes.
+        std::string encoded_metadata;
+        struct_pb::to_pb(*bucket, encoded_metadata);
+        bucket->meta_size = encoded_metadata.size();
+    }
+    int64_t required_size = bucket->data_size + bucket->meta_size;
+    if (bucket_backend_config_.direct_io_write) {
+        // Reserve separate 4KiB allocation units for data and metadata; even
+        // an exact-length tiny .meta normally occupies one physical block.
+        // Persisted offsets/sizes remain logical for existing readers.
+        if (required_size > std::numeric_limits<int64_t>::max() -
+                                2 * static_cast<int64_t>(kDirectIOAlignment)) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        required_size = static_cast<int64_t>(
+                            align_up(bucket->data_size, kDirectIOAlignment)) +
+                        static_cast<int64_t>(
+                            align_up(bucket->meta_size, kDirectIOAlignment));
+    }
     auto prepare_result = PrepareEviction(required_size, bucket->keys);
     if (!prepare_result) {
         return tl::make_unexpected(prepare_result.error());
@@ -1799,6 +1822,9 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     if (!write_bucket_result) {
         LOG(ERROR) << "Failed to write bucket with id: " << bucket_id;
         ReleasePreparedWrite(pending);
+        if (bucket_backend_config_.direct_io_write) {
+            CleanupOrphanedBucket(bucket_id);
+        }
         return tl::make_unexpected(write_bucket_result.error());
     }
     VLOG(1) << "Written bucket with id: " << bucket_id;
@@ -2103,6 +2129,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GetBucketKeys(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
     namespace fs = std::filesystem;
+    if (bucket_backend_config_.direct_io_write &&
+        !bucket_backend_config_.Validate()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (bucket_backend_config_.direct_io_write && !aligned_io_buffer_) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     try {
         if (initialized_.load(std::memory_order_acquire)) {
             LOG(ERROR) << "Storage backend already initialized";
@@ -2592,7 +2625,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     auto bucket_data_path = bucket_data_path_res.value();
-    auto open_file_result = OpenFile(bucket_data_path, FileMode::Write);
+    auto open_file_result = OpenFile(bucket_data_path, FileMode::Write, true);
     if (!open_file_result) {
         LOG(ERROR) << "Failed to open file for bucket writing: "
                    << bucket_data_path;
@@ -2600,72 +2633,67 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     }
     auto file = std::move(open_file_result.value());
 
-#ifdef USE_URING
-    // Try to use write_aligned for O_DIRECT I/O if file is UringFile
-    UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
-    if (uring_file != nullptr) {
-        size_t total_size = static_cast<size_t>(bucket_metadata->data_size);
-        size_t aligned_size = align_up(total_size, kDirectIOAlignment);
-
-        // Allocate aligned buffer if needed
-        void* write_buffer = nullptr;
-        std::unique_ptr<void, void (*)(void*)> temp_buffer{nullptr,
-                                                           [](void*) {}};
-
-        if (aligned_size <= kAlignedBufferSize && aligned_io_buffer_) {
-            // Use the pre-allocated buffer
-            write_buffer = aligned_io_buffer_.get();
-        } else {
-            // Allocate a temporary larger buffer
-            void* buf = nullptr;
-            int ret = posix_memalign(&buf, kDirectIOAlignment, aligned_size);
-            if (ret != 0) {
-                LOG(ERROR)
-                    << "Failed to allocate aligned buffer for WriteBucket: "
-                    << strerror(ret);
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    if (bucket_backend_config_.direct_io_write) {
+        // Bound staging memory even for 256MiB buckets. Serialize only users
+        // of this shared buffer; never hold the metadata mutex during IO.
+        MutexLocker write_lock(&direct_write_mutex_);
+        auto* buffer = static_cast<char*>(aligned_io_buffer_.get());
+        if (buffer == nullptr) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        size_t buffered = 0;
+        off_t offset = 0;
+        auto flush = [&]() -> tl::expected<void, ErrorCode> {
+            if (buffered == 0) return {};
+            const size_t aligned_size = align_up(buffered, kDirectIOAlignment);
+            std::memset(buffer + buffered, 0, aligned_size - buffered);
+            const iovec chunk{buffer, aligned_size};
+            // One aligned pwritev, including when io_uring is unavailable.
+            // Short writes (also zero) fail closed: no unaligned retry.
+            const auto injected = direct_write_result_for_test_.load();
+            auto written = [&]() -> tl::expected<size_t, ErrorCode> {
+                if (injected == -2) {
+                    return file->vector_write(&chunk, 1, offset);
+                }
+                if (injected < 0) {
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                }
+                return static_cast<size_t>(injected);
+            }();
+            if (!written) return tl::make_unexpected(written.error());
+            if (written.value() != aligned_size) {
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
             }
-            temp_buffer.reset(buf);
-            temp_buffer = std::unique_ptr<void, void (*)(void*)>(
-                buf, [](void* p) { free(p); });
-            write_buffer = buf;
-            LOG(WARNING) << "WriteBucket: bucket_id=" << bucket_id
-                         << " requires " << aligned_size
-                         << " bytes, exceeds buffer size " << kAlignedBufferSize
-                         << ", using temporary allocation";
-        }
-
-        // Aggregate all iovs data into the aligned buffer
-        char* dst = static_cast<char*>(write_buffer);
+            offset += aligned_size;
+            buffered = 0;
+            return {};
+        };
         for (const auto& iov : iovs) {
-            memcpy(dst, iov.iov_base, iov.iov_len);
-            dst += iov.iov_len;
+            auto* source = static_cast<const char*>(iov.iov_base);
+            size_t remaining = iov.iov_len;
+            while (remaining != 0) {
+                const size_t count =
+                    std::min(remaining, kAlignedBufferSize - buffered);
+                std::memcpy(buffer + buffered, source, count);
+                source += count;
+                remaining -= count;
+                buffered += count;
+                if (buffered == kAlignedBufferSize) {
+                    auto result = flush();
+                    if (!result) return result;
+                }
+            }
         }
-
-        // Zero-pad the remaining bytes
-        if (aligned_size > total_size) {
-            memset(dst, 0, aligned_size - total_size);
-        }
-
-        // Write using write_aligned
-        auto write_result =
-            uring_file->write_aligned(write_buffer, aligned_size, 0);
-        if (!write_result) {
-            LOG(ERROR) << "write_aligned failed for: " << bucket_id
-                       << ", error: " << write_result.error();
-            return tl::make_unexpected(write_result.error());
-        }
-        if (write_result.value() != aligned_size) {
-            LOG(ERROR) << "Write size mismatch for: " << bucket_data_path
-                       << ", expected: " << aligned_size
-                       << ", got: " << write_result.value();
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
+        auto final_write = flush();
+        if (!final_write) return final_write;
 
         // Flush bucket data to stable storage before writing metadata.
         // This prevents a crash from leaving valid metadata pointing at
         // incomplete data (write-ordering durability guarantee).
-        auto sync_result = uring_file->datasync();
+        if (direct_write_datasync_failure_for_test_.load()) {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        auto sync_result = file->datasync();
         if (!sync_result) {
             LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
@@ -2676,10 +2704,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             MutexLocker cache_locker(&file_cache_mutex_);
             file_cache_.erase(bucket_data_path);
         }
-    } else
-#endif
-    {
-        // Fallback to vector_write for non-UringFile
+    } else {
+        // Preserve the default buffered POSIX path.
         auto write_result = file->vector_write(iovs.data(), iovs.size(), 0);
         if (!write_result) {
             LOG(ERROR) << "vector_write failed for: " << bucket_id
@@ -3566,7 +3592,8 @@ BucketStorageBackend::GetBucketMetadataPath(int64_t bucket_id) {
 }
 
 tl::expected<std::unique_ptr<StorageFile>, ErrorCode>
-BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
+BucketStorageBackend::OpenFile(const std::string& path, FileMode mode,
+                               bool bucket_data_write) const {
     int flags = O_CLOEXEC;
     int access_mode = 0;
     switch (mode) {
@@ -3578,10 +3605,13 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
             break;
     }
 
+    // Metadata writes must remain exact length. Only WriteBucket opts into
+    // the padded data-write path; use_uring continues to control reads only.
+    if (bucket_backend_config_.direct_io_write && mode == FileMode::Write &&
+        bucket_data_write) {
+        flags |= O_DIRECT;
+    }
 #ifdef USE_URING
-    // Use O_DIRECT only for reads: write latency is not sensitive in this
-    // scenario, and O_DIRECT writes require 4096-byte alignment padding which
-    // corrupts meta file parsing and wastes disk space on data files.
     if (file_storage_config_.use_uring && mode == FileMode::Read) {
         flags |= O_DIRECT;
     }

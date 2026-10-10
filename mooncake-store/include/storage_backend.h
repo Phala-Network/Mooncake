@@ -238,6 +238,10 @@ struct BucketBackendConfig {
     // max_physical_bytes > 0.
     int64_t disk_scan_cache_ms = 500;
 
+    // Opt-in POSIX O_DIRECT writes for bucket DATA only. Metadata and read
+    // mode remain unchanged; no io_uring dependency or security-policy change.
+    bool direct_io_write = false;
+
     bool Validate() const;
 
     static BucketBackendConfig FromEnvironment();
@@ -1051,7 +1055,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<std::string, ErrorCode> GetBucketDataPath(int64_t bucket_id);
 
     tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
-        const std::string& path, FileMode mode) const;
+        const std::string& path, FileMode mode,
+        bool bucket_data_write = false) const;
 
     tl::expected<void, ErrorCode> GroupOffloadingKeysByBucket(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
@@ -1174,6 +1179,15 @@ class BucketStorageBackend : public StorageBackendInterface {
         return lru_index_.size();
     }
 
+    void SetDirectWriteDatasyncFailureForTest(bool fail) {
+        direct_write_datasync_failure_for_test_.store(fail);
+    }
+
+    // -2 disables injection; -1 is an IO error; >=0 is a write result.
+    void SetDirectWriteResultForTest(int64_t result) {
+        direct_write_result_for_test_.store(result);
+    }
+
    private:
     // Alignment helper functions for O_DIRECT I/O
     static constexpr size_t kDirectIOAlignment = 4096;
@@ -1193,7 +1207,10 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     // Aligned buffer for O_DIRECT I/O operations
     // We use a fixed-size buffer to avoid frequent allocations
-    static constexpr size_t kAlignedBufferSize = 32 * 1024 * 1024;  // 16MB
+    static constexpr size_t kAlignedBufferSize = 32 * 1024 * 1024;
+    Mutex direct_write_mutex_;
+    std::atomic<bool> direct_write_datasync_failure_for_test_{false};
+    std::atomic<int64_t> direct_write_result_for_test_{-2};
     std::unique_ptr<void, void (*)(void*)> aligned_io_buffer_{nullptr,
                                                               [](void*) {}};
     /**
