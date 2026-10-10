@@ -7311,10 +7311,6 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     return {};
 }
 
-bool MasterService::HasMountedLocalDiskSegment(const UUID& client_id) {
-    return local_ssd_manager_.GetUsage(client_id).has_value();
-}
-
 auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                            bool enable_offloading)
     -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode> {

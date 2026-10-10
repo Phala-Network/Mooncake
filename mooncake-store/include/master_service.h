@@ -1973,15 +1973,6 @@ class MasterService {
         const std::function<bool(const Replica&)>& is_stale,
         MetadataShardAccessorRW* shard = nullptr);
 
-    // True when client_id currently has a LOCAL_DISK registration.
-    // Momentarily takes the LocalSsdManager registry lock, so callers must not
-    // hold it; call before taking a metadata shard lock. Callers that need the
-    // answer to stay true across a later metadata write must hold
-    // snapshot_mutex_ (shared) across both -- UnmountLocalDiskSegment
-    // deregisters the client under the exclusive lock, so the check and the
-    // write cannot straddle a deregistration.
-    bool HasMountedLocalDiskSegment(const UUID& client_id);
-
     auto RegisterLocalDiskReplica(const UUID& client_id, const std::string& key,
                                   const TenantId& tenant_id, Replica& replica,
                                   bool complete_offload)
