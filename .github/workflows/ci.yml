@@ -51,11 +51,10 @@ jobs:
         python-version: ['3.10', '3.12']
     runs-on: ${{ matrix.ubuntu-version }}
     env:
-      # The standard CUDA wheel builds PG extensions for these Torch versions
-      # using the CUDA 12.6 index. Keep the consumer test on the newest
-      # version that is actually packaged into that wheel.
-      MOONCAKE_TEST_TORCH_SPEC: torch==2.13.0+cu126
-      MOONCAKE_TEST_TORCH_INDEX_URL: https://download.pytorch.org/whl/cu126
+      # The wheel is built with CUDA 12.8. Use the supported cu128 Torch
+      # wheel so its bundled CUDA runtime supplies the same libcudart ABI.
+      MOONCAKE_TEST_TORCH_SPEC: torch==2.11.0+cu128
+      MOONCAKE_TEST_TORCH_INDEX_URL: https://download.pytorch.org/whl/cu128
     steps:
     - uses: actions/checkout@v4
       with:
