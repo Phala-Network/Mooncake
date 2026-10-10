@@ -58,6 +58,11 @@ class RdmaTransportTestPeer {
 
 class RdmaContextTestPeer {
    public:
+    static void bindWorkerPool(RdmaContext &context,
+                               std::shared_ptr<WorkerPool> pool) {
+        context.worker_pool_ = std::move(pool);
+    }
+
     static bool hasEndpointStore(const RdmaContext &context) {
         return context.endpoint_store_ != nullptr;
     }

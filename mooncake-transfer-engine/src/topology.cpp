@@ -709,6 +709,31 @@ Json::Value Topology::toJson() const {
     return root;
 }
 
+bool Topology::isDeviceEligible(const std::string &storage_type,
+                                const std::string &device_name,
+                                std::string_view local_hca) const {
+    auto it = resolved_matrix_.find(storage_type);
+    if (it == resolved_matrix_.end() ||
+        (it->second.preferred_hca.empty() && it->second.avail_hca.empty())) {
+        it = resolved_matrix_.find(kWildcardLocation);
+    }
+    if (it == resolved_matrix_.end()) return false;
+    int device_id = it->second.getHcaIndex(device_name);
+    if (device_id < 0) return false;
+    if (globalConfig().enable_hca_peer_affinity) {
+        auto local =
+            resolved_hca_peer_affinity_by_local_.find(std::string(local_hca));
+        if (local != resolved_hca_peer_affinity_by_local_.end()) {
+            auto hints = local->second.find(it->first);
+            if (hints != local->second.end() && !hints->second.empty()) {
+                return std::find(hints->second.begin(), hints->second.end(),
+                                 device_id) != hints->second.end();
+            }
+        }
+    }
+    return true;
+}
+
 int Topology::selectDevice(const std::string storage_type,
                            std::string_view hint, int retry_count) {
     const auto it = resolved_matrix_.find(std::string(storage_type));

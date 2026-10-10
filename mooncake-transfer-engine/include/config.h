@@ -26,6 +26,8 @@
 #include <utility>
 #include <vector>
 
+#include "rdma_rail_groups.h"
+
 namespace mooncake {
 
 enum class EndpointStoreType {
@@ -96,6 +98,7 @@ struct GlobalConfig {
     bool use_ipv6 = false;
     size_t fragment_limit = 16384;
     bool enable_dest_device_affinity = false;
+    RdmaRailGroups rdma_rail_groups;
     bool enable_hca_peer_affinity = false;
     std::unordered_map<std::string, std::vector<std::string>> nic_peer_affinity;
     bool log_rdma_slice_affinity = false;
