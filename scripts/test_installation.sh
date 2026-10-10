@@ -39,7 +39,13 @@ echo "Running import structure test..."
 cp -r mooncake-wheel/tests test_env/
 cp -r mooncake-reshard/tests test_env/reshard_tests
 cd test_env
-pip install torch numpy
+TORCH_SPEC="${MOONCAKE_TEST_TORCH_SPEC:-torch}"
+TORCH_INDEX_URL="${MOONCAKE_TEST_TORCH_INDEX_URL:-}"
+TORCH_INDEX_ARGS=()
+if [ -n "$TORCH_INDEX_URL" ]; then
+    TORCH_INDEX_ARGS=(--index-url "$TORCH_INDEX_URL" --extra-index-url https://pypi.org/simple)
+fi
+pip install "${TORCH_INDEX_ARGS[@]}" "$TORCH_SPEC" numpy
 python -c "import mooncake._fast_copy"
 python tests/test_fast_copy.py
 python tests/test_import_structure.py

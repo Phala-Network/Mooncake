@@ -139,7 +139,13 @@ sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store.py
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_replicated_distributed_object_store.py
 
-pip install torch numpy safetensors packaging
+TORCH_SPEC="${MOONCAKE_TEST_TORCH_SPEC:-torch}"
+TORCH_INDEX_URL="${MOONCAKE_TEST_TORCH_INDEX_URL:-}"
+TORCH_INDEX_ARGS=()
+if [ -n "$TORCH_INDEX_URL" ]; then
+    TORCH_INDEX_ARGS=(--index-url "$TORCH_INDEX_URL" --extra-index-url https://pypi.org/simple)
+fi
+pip install "${TORCH_INDEX_ARGS[@]}" "$TORCH_SPEC" numpy safetensors packaging
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_put_get_tensor.py
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_safetensor_functions.py
 sleep 1
