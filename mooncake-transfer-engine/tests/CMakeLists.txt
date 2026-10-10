@@ -50,13 +50,22 @@ add_test(NAME rdma_endpoint_state_test COMMAND rdma_endpoint_state_test)
 
 # Regression test for the reconnect storm of issue #3299: repeated local
 # completion faults toward one peer RNIC must pause that path instead of
-# re-handshaking it forever. The rail monitor is plain per-worker-pool state,
-# so this runs on every CI runner without an RDMA device.
+# re-handshaking it forever. The rail monitor is plain per-worker-pool state, so
+# this runs on every CI runner without an RDMA device.
 add_executable(worker_pool_rail_state_test
                ${WORKSPACE}/worker_pool_rail_state_test.cpp)
 target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
                                                          gtest_main)
 add_test(NAME worker_pool_rail_state_test COMMAND worker_pool_rail_state_test)
+
+add_executable(worker_pool_rail_policy_test
+               ${WORKSPACE}/worker_pool_rail_policy_test.cpp)
+target_link_libraries(worker_pool_rail_policy_test PUBLIC transfer_engine gtest
+                                                          gtest_main)
+add_test(NAME worker_pool_rail_policy_test COMMAND worker_pool_rail_policy_test)
+set_tests_properties(
+  worker_pool_rail_policy_test
+  PROPERTIES ENVIRONMENT "MC_RDMA_RAIL_GROUPS=10.80.20.0/24\;10.80.21.0/24")
 
 # Integration test for the monitorWorker reclaim tick (issue #1845). Self-skips
 # when no RDMA device is present, so safe to register with ctest.

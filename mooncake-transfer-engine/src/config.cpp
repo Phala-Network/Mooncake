@@ -101,6 +101,11 @@ void parseNicPeerAffinity(
 }  // namespace
 
 void loadGlobalConfig(GlobalConfig& config) {
+    if (!config.rdma_rail_groups.configure(
+            std::getenv("MC_RDMA_RAIL_GROUPS"))) {
+        LOG(FATAL) << "Invalid MC_RDMA_RAIL_GROUPS: expected nonempty, "
+                      "nonoverlapping IPv4 or IPv6 CIDRs separated by ';'";
+    }
     const char* num_cq_per_ctx_env = std::getenv("MC_NUM_CQ_PER_CTX");
     if (num_cq_per_ctx_env) {
         int val = atoi(num_cq_per_ctx_env);

@@ -94,6 +94,9 @@ class Topology {
                      int retry_count = 0);
     int selectDeviceByLocalHca(const std::string storage_type,
                                std::string_view local_hca, int retry_count = 0);
+    bool isDeviceEligible(const std::string &storage_type,
+                          const std::string &device_name,
+                          std::string_view local_hca = {}) const;
 
     TopologyMatrix getMatrix() const { return matrix_; }
 
