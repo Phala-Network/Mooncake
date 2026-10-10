@@ -8,6 +8,9 @@ ENV PATH=/usr/local/go/bin:$PATH
 FROM ghcr.io/phala-network/sglang:v0.5.21-phala-1@sha256:b4b08139f9180cbd09ddf14e48d6ea43dce084aa22b2ef084560ea18b25a7420 AS runtime
 ARG SOURCE_COMMIT=uncommitted-development
 LABEL org.opencontainers.image.revision=$SOURCE_COMMIT \
+      org.opencontainers.image.source="https://github.com/Phala-Network/Mooncake" \
+      org.opencontainers.image.url="https://github.com/Phala-Network/Mooncake/releases/tag/phala-v0.3.13-directio-1" \
+      org.opencontainers.image.version="phala-v0.3.13-directio-1" \
       io.phala.mooncake.change="opt-in POSIX direct DATA writes; native owner only"
 # Preserve the existing executable wrapper, master, Python extension and engine.
 COPY phala/directio/artifacts/mooncake_client /opt/sglang/lib/python3.12/site-packages/mooncake/mooncake_client
