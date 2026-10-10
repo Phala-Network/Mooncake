@@ -20,7 +20,9 @@
 #include <mutex>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <ylt/util/tl/expected.hpp>
+#include <ylt/struct_pb.hpp>
 
 #include "allocator.h"
 #include "utils.h"
@@ -5009,6 +5011,375 @@ TEST_F(StorageBackendTest,
     EXPECT_TRUE(exist_b.value())
         << "Freshly offloaded bucket must not be evicted immediately "
            "(its access timestamp must not be 0)";
+}
+
+TEST_F(StorageBackendTest, BucketDirectWriteOptInAndReadIndependence) {
+    ScopedEnvVar option{"MOONCAKE_OFFLOAD_BUCKET_DIRECT_IO_WRITE"};
+    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().direct_io_write);
+    option.Set("true");
+    auto bucket_config = BucketBackendConfig::FromEnvironment();
+    EXPECT_TRUE(bucket_config.direct_io_write);
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    EXPECT_FALSE(config.use_uring);
+    BucketStorageBackend backend(config, bucket_config);
+    EXPECT_TRUE(bucket_config.Validate());
+    EXPECT_TRUE(backend.Init());
+    option.Set("false");
+    EXPECT_FALSE(BucketBackendConfig::FromEnvironment().direct_io_write);
+}
+
+TEST_F(StorageBackendTest, BucketDirectWriteChunkBoundariesAndLegacyRecovery) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = false;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_size_limit = 64 * 1024 * 1024;
+    std::unordered_map<std::string, std::string> values;
+    values.emplace("legacy", "old unpadded bucket");
+    {
+        BucketStorageBackend legacy(config, bucket_config);
+        ASSERT_TRUE(legacy.Init());
+        auto& value = values.at("legacy");
+        auto result = legacy.BatchOffload(
+            {{"legacy", {Slice{value.data(), value.size()}}}},
+            [](const auto&, auto&) { return ErrorCode::OK; });
+        ASSERT_TRUE(result) << result.error();
+    }
+    bucket_config.direct_io_write = true;
+    {
+        BucketStorageBackend writer(config, bucket_config);
+        ASSERT_TRUE(writer.Init());
+        const std::vector<size_t> lengths{1,
+                                          4087,
+                                          4088,
+                                          4089,
+                                          4095,
+                                          4096,
+                                          4097,
+                                          32 * 1024 * 1024 - 8,
+                                          32 * 1024 * 1024 + 4097};
+        for (size_t i = 0; i < lengths.size(); ++i) {
+            const std::string key = "direct_" + std::to_string(i);
+            auto& value = values[key];
+            value.resize(lengths[i]);
+            for (size_t j = 0; j < value.size(); ++j) {
+                value[j] = static_cast<char>((j * 17 + i) % 251);
+            }
+            // Multiple iov boundaries, including one-byte slices, must not
+            // insert padding inside the logical bucket stream.
+            std::vector<Slice> slices{
+                Slice{value.data(), 1},
+                Slice{value.data() + 1, value.size() - 1}};
+            auto result = writer.BatchOffload(
+                {{key, slices}}, [&](const auto& keys, auto& metadata) {
+                    EXPECT_EQ(keys.size(), 1u);
+                    EXPECT_EQ(metadata.front().data_size, value.size());
+                    return ErrorCode::OK;
+                });
+            ASSERT_TRUE(result) << result.error();
+            const auto path = fs::path(data_path) /
+                              (std::to_string(result.value()) + ".bucket");
+            const size_t logical = key.size() + value.size();
+            EXPECT_EQ(fs::file_size(path), (logical + 4095) / 4096 * 4096);
+            // Metadata stays the original compact protobuf, never a padded
+            // direct-IO block. Init below exercises the actual parser.
+            const auto meta = fs::path(data_path) /
+                              (std::to_string(result.value()) + ".meta");
+            EXPECT_LT(fs::file_size(meta), 4096u);
+            std::ifstream input(meta, std::ios::binary);
+            std::string encoded(fs::file_size(meta), '\0');
+            input.read(encoded.data(), encoded.size());
+            ASSERT_EQ(input.gcount(), encoded.size());
+            BucketMetadata decoded;
+            ASSERT_NO_THROW(struct_pb::from_pb(decoded, encoded));
+            EXPECT_EQ(decoded.data_size, logical);
+            // This runtime-only field must not change reservation bytes.
+            decoded.meta_size = std::numeric_limits<int64_t>::max();
+            std::string reencoded;
+            struct_pb::to_pb(decoded, reencoded);
+            EXPECT_EQ(encoded, reencoded);
+        }
+    }
+    // Disable the new feature on reopen: existing POSIX reader semantics
+    // must read both old unpadded data and newly padded data unchanged.
+    bucket_config.direct_io_write = false;
+    BucketStorageBackend reader(config, bucket_config);
+    ASSERT_TRUE(reader.Init());
+    size_t scanned = 0;
+    reader.ResetScanIterator();
+    ASSERT_TRUE(reader.ScanMeta([&](const auto& keys, auto&) {
+        scanned += keys.size();
+        return ErrorCode::OK;
+    }));
+    EXPECT_EQ(scanned, values.size());
+    for (const auto& [key, value] : values) {
+        std::string actual(value.size(), '\0');
+        std::unordered_map<std::string, Slice> batch{
+            {key, Slice{actual.data(), actual.size()}}};
+        ASSERT_TRUE(reader.BatchLoad(batch));
+        EXPECT_EQ(actual, value);
+    }
+}
+
+TEST_F(StorageBackendTest, BucketDirectWriteMultipleKeysKeepOddOffsets) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.direct_io_write = true;
+    std::unordered_map<std::string, std::string> values{
+        {"a", "12"},
+        {"bbb", std::string(4098, 'b')},
+        {"ccccc", std::string(8192, 'c')}};
+    {
+        BucketStorageBackend writer(config, bucket_config);
+        ASSERT_TRUE(writer.Init());
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        for (auto& [key, value] : values) {
+            batch.emplace(
+                key, std::vector<Slice>{{value.data(), 1},
+                                        {value.data() + 1, value.size() - 1}});
+        }
+        std::string expected;
+        auto result =
+            writer.BatchOffload(batch, [&](const auto& keys, auto& metas) {
+                EXPECT_EQ(keys.size(), 3u);
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    EXPECT_EQ(metas[i].offset, expected.size());
+                    EXPECT_EQ(metas[i].key_size, keys[i].size());
+                    EXPECT_EQ(metas[i].data_size, values.at(keys[i]).size());
+                    // Every object's key+value length is odd, so the second
+                    // offset is odd regardless of unordered_map iteration
+                    // order.
+                    if (i == 1) EXPECT_EQ(metas[i].offset % 2, 1);
+                    expected += keys[i];
+                    expected += values.at(keys[i]);
+                }
+                return ErrorCode::OK;
+            });
+        ASSERT_TRUE(result);
+        expected.resize((expected.size() + 4095) / 4096 * 4096, '\0');
+        std::ifstream input(
+            fs::path(data_path) / (std::to_string(result.value()) + ".bucket"),
+            std::ios::binary);
+        std::string actual(expected.size(), '\0');
+        input.read(actual.data(), actual.size());
+        ASSERT_EQ(input.gcount(), actual.size());
+        EXPECT_EQ(actual, expected);
+    }
+    bucket_config.direct_io_write = false;
+    BucketStorageBackend reader(config, bucket_config);
+    ASSERT_TRUE(reader.Init());
+    for (const auto& [key, expected] : values) {
+        std::string actual(expected.size(), '\0');
+        std::unordered_map<std::string, Slice> batch{
+            {key, {actual.data(), actual.size()}}};
+        ASSERT_TRUE(reader.BatchLoad(batch));
+        EXPECT_EQ(actual, expected);
+    }
+}
+
+TEST_F(StorageBackendTest, BucketDirectWriteIncompleteWriteNeverPublishes) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.direct_io_write = true;
+    BucketStorageBackend writer(config, bucket_config);
+    ASSERT_TRUE(writer.Init());
+    std::string value(8193, 'w');
+    for (int64_t injected : {int64_t{0}, int64_t{4096}, int64_t{-1}}) {
+        SCOPED_TRACE(injected);
+        const std::string key = "fault_" + std::to_string(injected);
+        std::unordered_map<std::string, std::vector<Slice>> batch{
+            {key, {Slice{value.data(), value.size()}}}};
+        writer.SetDirectWriteResultForTest(injected);
+        bool notified = false;
+        auto failed = writer.BatchOffload(batch, [&](const auto&, auto&) {
+            notified = true;
+            return ErrorCode::OK;
+        });
+        ASSERT_FALSE(failed);
+        EXPECT_EQ(failed.error(), ErrorCode::FILE_WRITE_FAIL);
+        EXPECT_FALSE(notified);
+        EXPECT_FALSE(writer.IsExist(key).value());
+        EXPECT_TRUE(fs::is_empty(data_path));
+        writer.SetDirectWriteResultForTest(-2);
+        auto retry = writer.BatchOffload(
+            batch, [](const auto&, auto&) { return ErrorCode::OK; });
+        ASSERT_TRUE(retry) << retry.error();
+        std::string actual(value.size(), '\0');
+        std::unordered_map<std::string, Slice> reads{
+            {key, {actual.data(), actual.size()}}};
+        ASSERT_TRUE(writer.BatchLoad(reads));
+        EXPECT_EQ(actual, value);
+        ASSERT_TRUE(writer.DeleteBucket(retry.value()));
+        EXPECT_TRUE(fs::is_empty(data_path));
+    }
+}
+
+TEST_F(StorageBackendTest, BucketDirectWritePhysicalCapExactMetadataBoundary) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.direct_io_write = true;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.max_total_size = 1024 * 1024;
+    bucket_config.disk_scan_cache_ms = 0;
+    std::string value = "x";
+    BucketMetadata metadata{};
+    metadata.data_size = 2;  // one-byte key and one-byte value
+    metadata.keys = {"k"};
+    metadata.metadatas = {{0, 1, 1}};
+    std::string encoded;
+    struct_pb::to_pb(metadata, encoded);
+    const int64_t reservation = 4096 + (encoded.size() + 4095) / 4096 * 4096;
+    for (int deficit : {1, 0}) {
+        SCOPED_TRACE(deficit);
+        bucket_config.max_physical_bytes = reservation - deficit;
+        BucketStorageBackend writer(config, bucket_config);
+        ASSERT_TRUE(writer.Init());
+        bool notified = false;
+        auto result = writer.BatchOffload(
+            {{"k", {{value.data(), value.size()}}}}, [&](const auto&, auto&) {
+                notified = true;
+                return ErrorCode::OK;
+            });
+        if (deficit != 0) {
+            EXPECT_FALSE(result);
+            EXPECT_FALSE(notified);
+            EXPECT_TRUE(fs::is_empty(data_path));
+        } else {
+            ASSERT_TRUE(result) << result.error();
+            EXPECT_TRUE(notified);
+            const auto meta_path = fs::path(data_path) /
+                                   (std::to_string(result.value()) + ".meta");
+            EXPECT_EQ(fs::file_size(meta_path), encoded.size());
+            const auto data_file = fs::path(data_path) /
+                                   (std::to_string(result.value()) + ".bucket");
+            struct stat data_stat{}, meta_stat{};
+            ASSERT_EQ(::stat(data_file.c_str(), &data_stat), 0);
+            ASSERT_EQ(::stat(meta_path.c_str(), &meta_stat), 0);
+            EXPECT_LE((data_stat.st_blocks + meta_stat.st_blocks) * 512,
+                      reservation);
+        }
+    }
+}
+
+TEST_F(StorageBackendTest, BucketDirectWriteDatasyncFailureNeverPublishes) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.direct_io_write = true;
+    BucketStorageBackend writer(config, bucket_config);
+    ASSERT_TRUE(writer.Init());
+    writer.SetDirectWriteDatasyncFailureForTest(true);
+    std::string value(8193, 's');
+    std::unordered_map<std::string, std::vector<Slice>> batch{
+        {"sync", {Slice{value.data(), value.size()}}}};
+    bool notified = false;
+    auto failed = writer.BatchOffload(batch, [&](const auto&, auto&) {
+        notified = true;
+        return ErrorCode::OK;
+    });
+    ASSERT_FALSE(failed);
+    EXPECT_EQ(failed.error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_FALSE(notified);
+    EXPECT_FALSE(writer.IsExist("sync").value());
+    EXPECT_TRUE(fs::is_empty(data_path));
+    writer.SetDirectWriteDatasyncFailureForTest(false);
+    ASSERT_TRUE(writer.BatchOffload(
+        batch, [](const auto&, auto&) { return ErrorCode::OK; }));
+}
+
+TEST_F(StorageBackendTest, BucketDirectWriteConcurrentBuffersStayIntact) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.direct_io_write = true;
+    bucket_config.bucket_size_limit = 64 * 1024 * 1024;
+    BucketStorageBackend writer(config, bucket_config);
+    ASSERT_TRUE(writer.Init());
+    std::atomic<int> ready{0};
+    std::atomic<int> succeeded{0};
+    auto work = [&](const std::string& key, char fill) {
+        std::string value(32 * 1024 * 1024 + 4097, fill);
+        ready.fetch_add(1);
+        while (ready.load() != 2) std::this_thread::yield();
+        auto result = writer.BatchOffload(
+            {{key, {Slice{value.data(), value.size()}}}},
+            [](const auto&, auto&) { return ErrorCode::OK; });
+        if (result) succeeded.fetch_add(1);
+    };
+    std::thread first(work, "first", 'a');
+    std::thread second(work, "second", 'b');
+    first.join();
+    second.join();
+    ASSERT_EQ(succeeded.load(), 2);
+    for (const auto& [key, fill] : std::vector<std::pair<std::string, char>>{
+             {"first", 'a'}, {"second", 'b'}}) {
+        std::string actual(32 * 1024 * 1024 + 4097, '\0');
+        std::unordered_map<std::string, Slice> batch{
+            {key, Slice{actual.data(), actual.size()}}};
+        ASSERT_TRUE(writer.BatchLoad(batch));
+        EXPECT_EQ(actual, std::string(actual.size(), fill));
+    }
+}
+
+TEST_F(StorageBackendTest, BucketDirectWriteNotifyFailureCleansAndCanRetry) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.direct_io_write = true;
+    BucketStorageBackend writer(config, bucket_config);
+    ASSERT_TRUE(writer.Init());
+    std::string value(4097, 'q');
+    std::unordered_map<std::string, std::vector<Slice>> batch{
+        {"retry", {Slice{value.data(), value.size()}}}};
+    int notified = 0;
+    auto failed = writer.BatchOffload(batch, [&](const auto&, auto&) {
+        ++notified;
+        return ErrorCode::INTERNAL_ERROR;
+    });
+    ASSERT_FALSE(failed);
+    EXPECT_EQ(notified, 1);
+    EXPECT_FALSE(writer.IsExist("retry").value());
+    for (const auto& entry : fs::directory_iterator(data_path)) {
+        EXPECT_NE(entry.path().extension(), ".bucket");
+        EXPECT_NE(entry.path().extension(), ".meta");
+    }
+    auto retried = writer.BatchOffload(
+        batch, [](const auto&, auto&) { return ErrorCode::OK; });
+    ASSERT_TRUE(retried) << retried.error();
+    std::string actual(value.size(), '\0');
+    std::unordered_map<std::string, Slice> reads{
+        {"retry", Slice{actual.data(), actual.size()}}};
+    ASSERT_TRUE(writer.BatchLoad(reads));
+    EXPECT_EQ(actual, value);
+}
+
+TEST_F(StorageBackendTest, BucketDirectWritePhysicalCapIncludesPadding) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.direct_io_write = true;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.max_total_size = 1024 * 1024;
+    // A one-byte object fits logically but its 4KiB data block does not.
+    bucket_config.max_physical_bytes = 4095;
+    bucket_config.disk_scan_cache_ms = 0;
+    BucketStorageBackend writer(config, bucket_config);
+    ASSERT_TRUE(writer.Init());
+    std::string value = "x";
+    bool notified = false;
+    auto result = writer.BatchOffload(
+        {{"k", {Slice{value.data(), value.size()}}}}, [&](const auto&, auto&) {
+            notified = true;
+            return ErrorCode::OK;
+        });
+    ASSERT_FALSE(result);
+    EXPECT_FALSE(notified);
+    EXPECT_FALSE(writer.IsExist("k").value());
+    EXPECT_TRUE(fs::is_empty(data_path));
 }
 
 #ifdef USE_URING
