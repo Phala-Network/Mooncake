@@ -50,6 +50,12 @@ jobs:
         ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
         python-version: ['3.10', '3.12']
     runs-on: ${{ matrix.ubuntu-version }}
+    env:
+      # The standard CUDA wheel builds PG extensions for these Torch versions
+      # using the CUDA 12.6 index. Keep the consumer test on the newest
+      # version that is actually packaged into that wheel.
+      MOONCAKE_TEST_TORCH_SPEC: torch==2.13.0+cu126
+      MOONCAKE_TEST_TORCH_INDEX_URL: https://download.pytorch.org/whl/cu126
     steps:
     - uses: actions/checkout@v4
       with:
