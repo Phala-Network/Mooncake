@@ -993,9 +993,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         // without blocking on one while holding the other, preserving the
         // atomic client/segment publication below.
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_,
-                                                       std::defer_lock);
+                                                        std::defer_lock);
         std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_,
-                                                         std::defer_lock);
+                                                          std::defer_lock);
         std::lock(client_lock, snapshot_lock);
         for (const auto& segment : segments) {
             if (!segment.host_id.empty()) {

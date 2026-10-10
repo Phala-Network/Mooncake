@@ -718,9 +718,9 @@ class MasterServiceHATest : public ::testing::Test {
         ASSERT_TRUE(service.ReMountSegment({}, healthy_client).has_value());
 
         std::unique_lock<std::shared_mutex> writer(service.snapshot_mutex_,
-                                                  std::defer_lock);
+                                                   std::defer_lock);
         std::shared_lock<std::shared_mutex> reader(service.snapshot_mutex_,
-                                                  std::defer_lock);
+                                                   std::defer_lock);
         if (exclusive) {
             writer.lock();
         } else {
