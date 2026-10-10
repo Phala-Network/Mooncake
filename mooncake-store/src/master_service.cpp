@@ -4662,115 +4662,141 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
 auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                                const TenantId& tenant_id, Replica& replica)
     -> tl::expected<bool, ErrorCode> {
+    return RegisterLocalDiskReplica(client_id, key, tenant_id, replica, false);
+}
+
+auto MasterService::RegisterLocalDiskReplica(
+    const UUID& client_id, const std::string& key, const TenantId& tenant_id,
+    Replica& replica, bool complete_offload) -> tl::expected<bool, ErrorCode> {
     assert(tenant_id.IsValid());
+    if (!replica.is_local_disk_replica() || !replica.is_completed()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const auto incoming = replica.get_descriptor().get_local_disk_descriptor();
+    if (incoming.client_id != client_id ||
+        incoming.object_size >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     TenantId normalized_tenant;
+    bool requires_offload_task = false;
     std::unique_lock<std::mutex> policy_lock(tenant_quota_policy_mutex_,
                                              std::defer_lock);
     if (enable_multi_tenants_) {
         policy_lock.lock();
-        auto normalized_tenant_result =
-            ResolveTenantIdForWriteLocked(tenant_id);
-        if (!normalized_tenant_result) {
-            return tl::make_unexpected(normalized_tenant_result.error());
+        auto normalized = ResolveTenantIdForWriteLocked(tenant_id);
+        if (!normalized) {
+            if (!complete_offload ||
+                normalized.error() != ErrorCode::TENANT_NOT_REGISTERED)
+                return tl::unexpected(normalized.error());
+            normalized_tenant = tenant_id;
+            requires_offload_task = true;
+        } else {
+            normalized_tenant = std::move(*normalized);
         }
-        normalized_tenant = std::move(normalized_tenant_result.value());
     }
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    // Same admission rule as NotifyOffloadSuccess's existing-object path,
-    // checked inside the same shared-lock section as the write below: a disk
-    // replica may only be registered for a client whose LOCAL_DISK segment
-    // entry still exists, so a registration cannot land after a concurrent
-    // UnmountLocalDiskSegment's sweep and survive as a stale owner. Scoped
-    // to enable_offload_, where the segment registry exists and a
-    // deregistration can race; with the subsystem off both the mount and
-    // unmount RPCs refuse, so there is nothing to check against and no race
-    // to close.
-    if (enable_offload_ && !HasMountedLocalDiskSegment(client_id)) {
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    }
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
     const ObjectIdentity object_id{std::move(normalized_tenant), key};
-    MetadataAccessorRW accessor(this, object_id);
-    if (!accessor.Exists()) {
-        accessor.Create(
-            client_id,
-            replica.get_descriptor().get_local_disk_descriptor().object_size,
-            std::vector<Replica>{});
-    }
-    auto& metadata = accessor.Get();
-    if (replica.type() != ReplicaType::LOCAL_DISK) {
-        LOG(ERROR) << "Invalid replica type: " << replica.type()
-                   << ". Expected ReplicaType::LOCAL_DISK.";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    const bool replacing_existing =
-        metadata.HasReplica(&Replica::fn_is_local_disk_replica);
-
-    if (enable_oplog_ && ordered_oplog_writer_) {
-        std::vector<Replica::Descriptor> post;
-        for (const auto& existing : metadata.GetAllReplicas()) {
-            if (existing.status() != ReplicaStatus::COMPLETE) continue;
-            if (replacing_existing &&
-                existing.type() == ReplicaType::LOCAL_DISK &&
-                existing.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .client_id == client_id) {
-                // Substitute with the updated descriptor.
-                Replica::Descriptor updated = existing.get_descriptor();
-                updated.get_local_disk_descriptor().transport_endpoint =
-                    replica.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .transport_endpoint;
-                updated.get_local_disk_descriptor().object_size =
-                    replica.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .object_size;
-                post.push_back(std::move(updated));
+    bool added = false;
+    const auto transition =
+        [&](const LocalSsdManager::UsageCommit& commit_usage)
+        -> tl::expected<void, ErrorCode> {
+        MetadataAccessorRW accessor(this, object_id);
+        if (requires_offload_task &&
+            (!accessor.Exists() ||
+             !accessor.GetTenantState().offloading_tasks.contains(key))) {
+            return tl::unexpected(ErrorCode::TENANT_NOT_REGISTERED);
+        }
+        Replica* existing = nullptr;
+        if (accessor.Exists()) {
+            auto& metadata = accessor.Get();
+            // Re-registration may repair a descriptor, not resize a logical
+            // key.
+            if (metadata.size != incoming.object_size)
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            metadata.VisitReplicas(
+                [&](const Replica& rep) {
+                    return rep.is_completed() &&
+                           rep.get_local_disk_client_id() == client_id;
+                },
+                [&](Replica& rep) { existing = &rep; });
+        }
+        const uint64_t old_size = existing ? existing->get_descriptor()
+                                                 .get_local_disk_descriptor()
+                                                 .object_size
+                                           : 0;
+        if (old_size >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        if (enable_oplog_ && ordered_oplog_writer_) {
+            std::vector<Replica::Descriptor> post;
+            if (accessor.Exists()) {
+                for (const auto& rep : accessor.Get().GetAllReplicas()) {
+                    if (!rep.is_completed()) continue;
+                    auto desc = rep.get_descriptor();
+                    if (&rep == existing) {
+                        desc.get_local_disk_descriptor().transport_endpoint =
+                            incoming.transport_endpoint;
+                        desc.get_local_disk_descriptor().object_size =
+                            incoming.object_size;
+                    }
+                    post.push_back(std::move(desc));
+                }
+            }
+            if (!existing) post.push_back(replica.get_descriptor());
+            std::string payload;
+            if (accessor.Exists()) {
+                payload = SerializeMetadataForOpLogFromReplicaDescriptors(
+                    accessor.Get(), post);
             } else {
-                post.push_back(existing.get_descriptor());
+                MetadataPayload metadata_payload;
+                metadata_payload.client_id = client_id;
+                metadata_payload.size = incoming.object_size;
+                metadata_payload.replicas = std::move(post);
+                auto bytes = struct_pack::serialize(metadata_payload);
+                payload.assign(bytes.begin(), bytes.end());
+            }
+            auto persisted = AppendOpLogVisibleBeforeDurable(
+                OpType::PUT_END, object_id.tenant_id.value(), key, payload);
+            if (!persisted) return tl::unexpected(persisted.error());
+        }
+        if (!accessor.Exists())
+            accessor.Create(client_id, incoming.object_size, {});
+        auto& metadata = accessor.Get();
+        if (existing) {
+            existing->update_local_disk_location(incoming.transport_endpoint,
+                                                 incoming.object_size);
+        } else {
+            std::vector<Replica> replicas;
+            replicas.emplace_back(std::move(replica));
+            metadata.AddReplicas(std::move(replicas));
+            accessor.GetShard().OnDiskReplicaAdded(metadata);
+            SyncCacheTotalAccounting(metadata);
+            added = true;
+        }
+        if (complete_offload) {
+            auto& tasks = accessor.GetTenantState().offloading_tasks;
+            auto it = tasks.find(key);
+            if (it != tasks.end()) {
+                if (auto* source =
+                        metadata.GetReplicaByID(it->second.source_id))
+                    source->dec_refcnt();
+                tasks.erase(it);
             }
         }
-        if (!replacing_existing) {
-            // The new LOCAL_DISK replica is COMPLETE upon AddReplica.
-            post.push_back(replica.get_descriptor());
-        }
-
-        auto persist_result = AppendOpLogVisibleBeforeDurable(
-            OpType::PUT_END, object_id.tenant_id.value(), key,
-            SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post));
-        if (!persist_result) {
-            return tl::make_unexpected(persist_result.error());
-        }
+        commit_usage(static_cast<int64_t>(incoming.object_size) -
+                     static_cast<int64_t>(old_size));
+        return {};
+    };
+    if (enable_offload_) {
+        auto result =
+            local_ssd_manager_.ApplyUsageTransition(client_id, transition);
+        if (!result) return tl::unexpected(result.error());
+    } else {
+        auto result = transition([](int64_t) {});
+        if (!result) return tl::unexpected(result.error());
     }
-
-    if (!replacing_existing) {
-        std::vector<Replica> replicas;
-        replicas.emplace_back(std::move(replica));
-        metadata.AddReplicas(std::move(replicas));
-        auto& shard = accessor.GetShard();
-        shard.OnDiskReplicaAdded(metadata);
-        SyncCacheTotalAccounting(metadata);
-        return true;
-    }
-
-    metadata.VisitReplicas(
-        [client_id](const Replica& rep) {
-            return rep.type() == ReplicaType::LOCAL_DISK &&
-                   rep.get_descriptor().get_local_disk_descriptor().client_id ==
-                       client_id;
-        },
-        [&replica](Replica& rep) {
-            rep.get_descriptor()
-                .get_local_disk_descriptor()
-                .transport_endpoint = replica.get_descriptor()
-                                          .get_local_disk_descriptor()
-                                          .transport_endpoint;
-            rep.get_descriptor().get_local_disk_descriptor().object_size =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .object_size;
-        });
-    return false;
+    return added;
 }
 
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
@@ -7407,125 +7433,28 @@ auto MasterService::NotifyOffloadSuccess(
 
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
-        bool handled_existing_object = false;
-        bool added_new_local_disk_replica = false;
-        {
-            std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-            // A disk replica may only be registered for a client whose
-            // LOCAL_DISK segment entry still exists. Checked inside this
-            // shared-lock section, before the shard lock, so the check and
-            // the write below cannot straddle UnmountLocalDiskSegment's
-            // removal (which holds snapshot_mutex_ exclusively): either the
-            // replica lands first and its sweep erases it, or the check here
-            // sees the segment gone and refuses. Without this, a
-            // registration racing a deregistration -- an in-flight rescan
-            // batch, or an offload completion from a heartbeat that was past
-            // its own drain check -- could land after the sweep and leave
-            // the master advertising a departed owner. Scoped to
-            // enable_offload_, where the segment registry exists and a
-            // deregistration can race; with the subsystem off both the mount
-            // and unmount RPCs refuse, so there is nothing to check against
-            // and no race to close.
-            const bool segment_mounted =
-                !enable_offload_ || HasMountedLocalDiskSegment(client_id);
-            MetadataAccessorRW accessor(this, request_object_id);
-            if (accessor.Exists()) {
-                auto& obj_metadata = accessor.Get();
-                auto& tenant_state = accessor.GetTenantState();
-                auto task_it = tenant_state.offloading_tasks.find(
-                    request_object_id.user_key);
-                if (task_it != tenant_state.offloading_tasks.end() &&
-                    replica.type() != ReplicaType::LOCAL_DISK) {
-                    LOG(ERROR) << "Invalid replica type: " << replica.type()
-                               << ". Expected ReplicaType::LOCAL_DISK.";
-                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-                }
-
-                // Existing orphan objects can only bypass tenant registration
-                // for a master-admitted offload completion. Without this task
-                // marker, fall through to the regular registration check.
-                if (task_it != tenant_state.offloading_tasks.end()) {
-                    auto source =
-                        obj_metadata.GetReplicaByID(task_it->second.source_id);
-                    if (source != nullptr) {
-                        source->dec_refcnt();
+        auto result = RegisterLocalDiskReplica(
+            client_id, request_object_id.user_key, request_object_id.tenant_id,
+            replica, true);
+        if (!result) {
+            if (result.error() == ErrorCode::SEGMENT_NOT_FOUND) {
+                refused_unmounted = true;
+                // Preserve NACK-style cleanup for a departed offload worker.
+                std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
+                MetadataAccessorRW accessor(this, request_object_id);
+                if (accessor.Exists()) {
+                    auto& pending = accessor.GetTenantState().offloading_tasks;
+                    auto it = pending.find(request_object_id.user_key);
+                    if (it != pending.end()) {
+                        if (auto* source = accessor.Get().GetReplicaByID(
+                                it->second.source_id))
+                            source->dec_refcnt();
+                        pending.erase(it);
                     }
-                    tenant_state.offloading_tasks.erase(task_it);
-
-                    if (!segment_mounted) {
-                        // The offload bookkeeping above still ran; only the
-                        // registration is refused.
-                        refused_unmounted = true;
-                    } else if (!obj_metadata.HasReplica(
-                                   &Replica::fn_is_local_disk_replica)) {
-                        std::vector<Replica> replicas;
-                        replicas.emplace_back(std::move(replica));
-                        obj_metadata.AddReplicas(std::move(replicas));
-                        auto& shard = accessor.GetShard();
-                        shard.OnDiskReplicaAdded(obj_metadata);
-                        SyncCacheTotalAccounting(obj_metadata);
-                        added_new_local_disk_replica = true;
-                    } else {
-                        obj_metadata.VisitReplicas(
-                            [client_id](const Replica& rep) {
-                                return rep.type() == ReplicaType::LOCAL_DISK &&
-                                       rep.get_descriptor()
-                                               .get_local_disk_descriptor()
-                                               .client_id == client_id;
-                            },
-                            [&replica](Replica& rep) {
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .transport_endpoint =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .transport_endpoint;
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .object_size =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .object_size;
-                            });
-                    }
-                    handled_existing_object = true;
                 }
+                continue;
             }
-        }
-
-        if (!handled_existing_object) {
-            auto normalized_tenant_result =
-                ResolveTenantIdForWrite(request_object_id.tenant_id);
-            if (!normalized_tenant_result) {
-                return tl::make_unexpected(normalized_tenant_result.error());
-            }
-            const ObjectIdentity object_id{
-                std::move(normalized_tenant_result.value()),
-                request_object_id.user_key};
-
-            auto res = AddReplica(client_id, object_id.user_key,
-                                  object_id.tenant_id, replica);
-            if (!res) {
-                if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
-                    continue;
-                }
-                if (res.error() == ErrorCode::SEGMENT_NOT_FOUND) {
-                    // AddReplica's own mounted-segment check refused it (the
-                    // segment entry vanished under a deregistration). Finish
-                    // the batch so remaining NACK cleanups still run.
-                    refused_unmounted = true;
-                    continue;
-                }
-                LOG(ERROR) << "Failed to add replica: error=" << res.error()
-                           << ", client_id=" << client_id
-                           << ", tenant_id=" << object_id.tenant_id.value()
-                           << ", key=" << object_id.user_key;
-                return tl::make_unexpected(res.error());
-            }
-            added_new_local_disk_replica = res.value();
-        }
-        if (metadata.data_size > 0 && added_new_local_disk_replica) {
-            local_ssd_manager_.AdjustUsedBytes(client_id, metadata.data_size);
+            return tl::unexpected(result.error());
         }
     }
 
@@ -11059,7 +10988,6 @@ void MasterService::ClientMonitorFunc() {
             std::vector<size_t> dec_capacities;
             std::vector<UUID> client_ids;
             std::vector<std::string> segment_names;
-            std::unordered_set<UUID, boost::hash<UUID>> alive_clients;
             std::shared_lock<std::shared_mutex> snapshot_lock;
             {
                 std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
@@ -11073,7 +11001,6 @@ void MasterService::ClientMonitorFunc() {
                     }
                     client_host_id_.erase(client_id);
                 }
-                alive_clients = ok_client_;
 
                 ScopedSegmentAccess segment_access =
                     segment_manager_.getSegmentAccess();
@@ -11105,7 +11032,24 @@ void MasterService::ClientMonitorFunc() {
             // Always clean up invalid handles when there are expired clients,
             // even if no memory segments were unmounted. This is necessary
             // to clean up local_disk replicas whose owner client has expired.
-            ClearInvalidHandles(alive_clients);
+            for (const auto& client_id : expired_clients) {
+                auto capacity = local_ssd_manager_.UnregisterClient(client_id);
+                if (capacity && *capacity > 0) {
+                    MasterMetricManager::instance().dec_total_file_capacity(
+                        *capacity);
+                }
+            }
+            // A concurrently mounted owner may be absent from alive_clients.
+            // Close admission before sweeping only the owners expired here.
+            const std::unordered_set<UUID, boost::hash<UUID>> expired(
+                expired_clients.begin(), expired_clients.end());
+            ClearStaleHandles([&expired](const Replica& rep) {
+                auto owner = rep.get_local_disk_client_id();
+                return rep.is_completed() &&
+                       (rep.has_invalid_mem_handle() ||
+                        rep.has_invalid_nof_handle() ||
+                        (owner && expired.contains(*owner)));
+            });
 
             // Commit unmount of memory segments and clean up local_disk
             // segments for expired clients. Both require the exclusive
@@ -11121,13 +11065,6 @@ void MasterService::ClientMonitorFunc() {
                               << ", action=unmount_expired_mem_segment";
                     // Clean up HTTP metadata if enabled
                     cleanupHttpMetadata(segment_names[i]);
-                }
-            }
-            for (const auto& client_id : expired_clients) {
-                auto capacity = local_ssd_manager_.UnregisterClient(client_id);
-                if (capacity && *capacity > 0) {
-                    MasterMetricManager::instance().dec_total_file_capacity(
-                        *capacity);
                 }
             }
             RecomputeTenantEffectiveQuotas();

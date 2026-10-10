@@ -4405,6 +4405,134 @@ TEST_F(MasterServiceHATest,
     EXPECT_FALSE(batch.entries[0].payload.empty());
 }
 
+TEST_F(MasterServiceHATest, SsdReregistrationPersistsBothOwnersAndRefresh) {
+    const std::string cluster = "ssd_reregister";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_enable_offload(true)
+                      .set_cluster_id(cluster)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    ASSERT_EQ(service.SetBatchOpLogBackendForTesting(backend), ErrorCode::OK);
+    const UUID a{91, 1}, b{91, 2};
+    ASSERT_TRUE(service.MountLocalDiskSegment(a, true));
+    ASSERT_TRUE(service.MountLocalDiskSegment(b, true));
+    std::vector<OffloadTaskItem> tasks{
+        {std::string(TenantId::kDefaultValue), "disk", 128}};
+    StorageObjectMetadata metadata{};
+    metadata.data_size = 128;
+    metadata.transport_endpoint = "old:50052";
+    ASSERT_TRUE(service.NotifyOffloadSuccess(a, tasks, {metadata}));
+    OpLogBatchStorage storage(cluster, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    ASSERT_TRUE(service.NotifyOffloadSuccess(b, tasks, {metadata}));
+    ReadBatchEventually(storage, 2, batch);
+    metadata.transport_endpoint = "new:50052";
+    ASSERT_TRUE(service.NotifyOffloadSuccess(b, tasks, {metadata}));
+    ReadBatchEventually(storage, 3, batch);
+    ASSERT_EQ(batch.entries.size(), 1);
+    auto payload =
+        struct_pack::deserialize<MetadataPayload>(batch.entries[0].payload);
+    ASSERT_TRUE(payload);
+    ASSERT_EQ(payload->replicas.size(), 2);
+    size_t owners = 0;
+    for (const auto& rep : payload->replicas) {
+        const auto& disk = rep.get_local_disk_descriptor();
+        if (disk.client_id == b) {
+            ++owners;
+            EXPECT_EQ(disk.transport_endpoint, "new:50052");
+        }
+    }
+    EXPECT_EQ(owners, 1);
+}
+
+TEST_F(MasterServiceHATest, SsdReregistrationRejectedOplogLeavesNoMutation) {
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_enable_offload(true)
+                      .set_cluster_id("ssd_reject")
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    auto* writer = InstallGatedWriter(service, backend);
+    const UUID owner{92, 1};
+    ASSERT_TRUE(service.MountLocalDiskSegment(owner, true));
+    std::vector<OffloadTaskItem> tasks{
+        {std::string(TenantId::kDefaultValue), "existing", 128}};
+    StorageObjectMetadata metadata{};
+    metadata.data_size = 128;
+    metadata.transport_endpoint = "old:50052";
+    ASSERT_TRUE(service.NotifyOffloadSuccess(owner, tasks, {metadata}));
+    writer->Stop();
+    metadata.transport_endpoint = "new:50052";
+    auto rejected = service.NotifyOffloadSuccess(owner, tasks, {metadata});
+    ASSERT_FALSE(rejected);
+    auto descs =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, "existing");
+    ASSERT_EQ(descs.size(), 1);
+    EXPECT_EQ(descs[0].get_local_disk_descriptor().transport_endpoint,
+              "old:50052");
+    tasks[0].key = "missing";
+    EXPECT_FALSE(service.NotifyOffloadSuccess(owner, tasks, {metadata}));
+    EXPECT_EQ(
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, "missing").size(),
+        0);
+    EXPECT_EQ(service.GetKeyCount(), 1);
+}
+
+TEST_F(MasterServiceHATest, SsdReregistrationSurvivesRemovedReplicaCallback) {
+    const std::string cluster = "ssd_removed_reregister";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_ha(true)
+                      .set_enable_oplog(true)
+                      .set_enable_offload(true)
+                      .set_cluster_id(cluster)
+                      .set_oplog_batch_max_entries(1)
+                      .build();
+    MasterService service(config);
+    auto* writer = InstallGatedWriter(service, backend);
+    auto mounted = PrepareSimpleSegment(service, "ssd_removed_segment");
+    ASSERT_TRUE(service.MountLocalDiskSegment(mounted.client_id, true));
+    OpLogBatchStorage storage(cluster, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    std::vector<OffloadTaskItem> tasks{
+        {std::string(TenantId::kDefaultValue), "disk", 128}};
+    StorageObjectMetadata metadata{};
+    metadata.data_size = 128;
+    metadata.transport_endpoint = "old:50052";
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(mounted.client_id, tasks, {metadata}));
+    ReadBatchEventually(storage, 2, batch);
+    const auto old_desc =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, "disk");
+    ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
+    ASSERT_TRUE(service.EvictDiskReplica(
+        mounted.client_id, "disk", kDefaultTenant, ReplicaType::LOCAL_DISK));
+    ReadBatchEventually(storage, 3, batch);
+    metadata.transport_endpoint = "new:50052";
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(mounted.client_id, tasks, {metadata}));
+    ReadBatchEventually(storage, 4, batch);
+    EXPECT_EQ(GetLocalDiskUsedBytesForTesting(service, "ssd_removed_segment"),
+              256);
+    ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+    auto live = ReplicaDescriptorsForTesting(service, kDefaultTenant, "disk");
+    ASSERT_EQ(live.size(), 1);
+    EXPECT_NE(live[0].id, old_desc[0].id);
+    EXPECT_EQ(live[0].get_local_disk_descriptor().transport_endpoint,
+              "new:50052");
+    EXPECT_EQ(GetLocalDiskUsedBytesForTesting(service, "ssd_removed_segment"),
+              128);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

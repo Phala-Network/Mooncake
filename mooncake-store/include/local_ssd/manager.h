@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <boost/functional/hash.hpp>
 #include <memory>
 #include <optional>
@@ -77,6 +78,12 @@ class LocalSsdManager {
 
     std::optional<Usage> GetUsage(const UUID& client_id) const;
     bool AdjustUsedBytes(const UUID& client_id, int64_t delta);
+    using UsageCommit = std::function<void(int64_t)>;
+    // Pin the owner; invoke commit under the metadata lock, after admission.
+    tl::expected<void, ErrorCode> ApplyUsageTransition(
+        const UUID& client_id,
+        const std::function<tl::expected<void, ErrorCode>(const UsageCommit&)>&
+            transition);
 
     ErrorCode EnqueueOffload(const UUID& client_id, OffloadTaskItem task,
                              size_t limit);

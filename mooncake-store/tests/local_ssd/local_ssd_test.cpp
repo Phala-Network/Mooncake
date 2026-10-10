@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <future>
 #include <thread>
 
 #include "local_ssd/manager.h"
@@ -179,6 +180,96 @@ TEST(LocalSsdManagerTest, UnregisterSerializesWithConcurrentOperations) {
     worker.join();
     EXPECT_TRUE(removed.has_value());
     EXPECT_FALSE(manager.GetUsage(client).has_value());
+}
+
+TEST(LocalSsdManagerTest, UsageTransitionPinsOwnerUntilCommit) {
+    LocalSsdManager manager;
+    const UUID owner{40, 1};
+    ASSERT_TRUE(manager.RegisterClient(owner, true) == ErrorCode::OK);
+    std::promise<void> entered, release;
+    auto proceed = release.get_future();
+    auto worker = std::async(std::launch::async, [&] {
+        return manager.ApplyUsageTransition(
+            owner,
+            [&](const LocalSsdManager::UsageCommit& commit)
+                -> tl::expected<void, ErrorCode> {
+                commit(128);
+                entered.set_value();
+                proceed.wait();
+                return {};
+            });
+    });
+    entered.get_future().wait();
+    EXPECT_EQ(manager.GetUsage(owner)->used_bytes, 128);
+    auto unregister = std::async(
+        std::launch::async, [&] { return manager.UnregisterClient(owner); });
+    EXPECT_EQ(unregister.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+    release.set_value();
+    EXPECT_TRUE(worker.get());
+    EXPECT_TRUE(unregister.get());
+    bool invoked = false;
+    auto late = manager.ApplyUsageTransition(
+        owner,
+        [&](const LocalSsdManager::UsageCommit& commit)
+            -> tl::expected<void, ErrorCode> {
+            invoked = true;
+            commit(128);
+            return {};
+        });
+    EXPECT_FALSE(late);
+    EXPECT_FALSE(invoked);
+}
+
+// A registry record is pinned, not just its UUID. Reusing a UUID while its
+// previous record drains must not charge the newly registered record.
+TEST(LocalSsdManagerTest, DrainingTransitionDoesNotChargeRemountedUuid) {
+    LocalSsdManager manager;
+    const UUID owner{40, 3};
+    ASSERT_TRUE(manager.RegisterClient(owner, true) == ErrorCode::OK);
+    std::promise<void> entered, release;
+    auto proceed = release.get_future();
+    auto worker = std::async(std::launch::async, [&] {
+        return manager.ApplyUsageTransition(
+            owner,
+            [&](const LocalSsdManager::UsageCommit& commit)
+                -> tl::expected<void, ErrorCode> {
+                entered.set_value();
+                proceed.wait();
+                commit(128);
+                return {};
+            });
+    });
+    entered.get_future().wait();
+    auto unregister = std::async(
+        std::launch::async, [&] { return manager.UnregisterClient(owner); });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (manager.GetUsage(owner) &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    EXPECT_FALSE(manager.GetUsage(owner));
+    EXPECT_TRUE(manager.RegisterClient(owner, true) == ErrorCode::OK);
+    release.set_value();
+    EXPECT_TRUE(worker.get());
+    EXPECT_TRUE(unregister.get());
+    auto usage = manager.GetUsage(owner);
+    ASSERT_TRUE(usage);
+    EXPECT_EQ(usage->used_bytes, 0);
+}
+
+TEST(LocalSsdManagerTest, RejectedUsageTransitionDoesNotCharge) {
+    LocalSsdManager manager;
+    const UUID owner{40, 2};
+    ASSERT_TRUE(manager.RegisterClient(owner, true) == ErrorCode::OK);
+    auto result = manager.ApplyUsageTransition(
+        owner,
+        [](const LocalSsdManager::UsageCommit&)
+            -> tl::expected<void, ErrorCode> {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        });
+    ASSERT_FALSE(result);
+    EXPECT_EQ(manager.GetUsage(owner)->used_bytes, 0);
 }
 
 TEST(LocalSsdManagerTest, CancelsOffloadMirrorsOnlyWhenAllArePending) {

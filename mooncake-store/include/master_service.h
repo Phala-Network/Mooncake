@@ -1982,6 +1982,11 @@ class MasterService {
     // write cannot straddle a deregistration.
     bool HasMountedLocalDiskSegment(const UUID& client_id);
 
+    auto RegisterLocalDiskReplica(const UUID& client_id, const std::string& key,
+                                  const TenantId& tenant_id, Replica& replica,
+                                  bool complete_offload)
+        -> tl::expected<bool, ErrorCode>;
+
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
     auto AllocateAndInsertMetadata(

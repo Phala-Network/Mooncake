@@ -203,6 +203,31 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         service.tenant_quota_policy_store_ = std::move(store);
     }
 
+    void SetStaleDiskSize(MasterService& service, const UUID& owner,
+                          const std::string& key, uint64_t size) {
+        MasterService::MetadataAccessorRW accessor(
+            &service, MasterService::ObjectIdentity{TenantId::Default(), key});
+        ASSERT_TRUE(accessor.Exists());
+        accessor.Get().VisitReplicas(
+            [&](const Replica& rep) {
+                return rep.get_local_disk_client_id() == owner;
+            },
+            [&](Replica& rep) {
+                auto disk = rep.get_descriptor().get_local_disk_descriptor();
+                rep.update_local_disk_location(disk.transport_endpoint, size);
+                service.local_ssd_manager_.AdjustUsedBytes(
+                    owner, static_cast<int64_t>(size) - disk.object_size);
+            });
+    }
+
+    size_t PendingOffloads(MasterService& service, const std::string& key) {
+        MasterService::MetadataAccessorRW accessor(
+            &service, MasterService::ObjectIdentity{TenantId::Default(), key});
+        return accessor.Exists()
+                   ? accessor.GetTenantState().offloading_tasks.count(key)
+                   : 0;
+    }
+
     int64_t LocalDiskUsedBytes(MasterService& service, const UUID& client_id) {
         auto usage = service.local_ssd_manager_.GetUsage(client_id);
         EXPECT_TRUE(usage.has_value());
@@ -605,8 +630,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     EXPECT_EQ(result.error(), ErrorCode::TENANT_NOT_REGISTERED);
 }
 
-TEST_F(MasterServiceTenantQuotaTest,
-       NotifyOffloadSuccessDoesNotCountAddReplicaUpdateAsNewDiskUsage) {
+TEST_F(MasterServiceTenantQuotaTest, NotifyOffloadSuccessChargesEachOwnerOnce) {
     const std::string policy = WritePolicyFile({{TenantId("tenant-a"), 1000}});
     auto config = MasterServiceConfig::builder()
                       .set_enable_multi_tenants(true)
@@ -638,7 +662,10 @@ TEST_F(MasterServiceTenantQuotaTest,
 
     ASSERT_TRUE(result.has_value()) << toString(result.error());
     EXPECT_EQ(LocalDiskUsedBytes(service, client_a), 128);
-    EXPECT_EQ(LocalDiskUsedBytes(service, client_b), 0);
+    EXPECT_EQ(LocalDiskUsedBytes(service, client_b), 128);
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(client_b, tasks, {second_metadata}));
+    EXPECT_EQ(LocalDiskUsedBytes(service, client_b), 128);
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
@@ -1214,6 +1241,119 @@ TEST_F(MasterServiceTenantQuotaTest,
                     .Remove("orphan-key", TenantId("tenant-b"),
                             /*force=*/true)
                     .has_value());
+}
+
+TEST_F(MasterServiceTenantQuotaTest, SsdRestartOverlapSurvivesOldOwnerCleanup) {
+    for (const std::string endpoint : {"same:50052", "different:50052"}) {
+        auto config =
+            MasterServiceConfig::builder().set_enable_offload(true).build();
+        config.client_live_ttl_sec = 3600;
+        MasterService service(config);
+        const UUID old_owner{31, 1}, new_owner{31, 2};
+        ASSERT_TRUE(service.MountLocalDiskSegment(old_owner, true));
+        ASSERT_TRUE(service.MountLocalDiskSegment(new_owner, true));
+        std::vector<OffloadTaskItem> tasks{
+            {std::string(TenantId::kDefaultValue), "restart", 128}};
+        StorageObjectMetadata metadata{};
+        metadata.data_size = 128;
+        metadata.transport_endpoint = "same:50052";
+        ASSERT_TRUE(service.NotifyOffloadSuccess(old_owner, tasks, {metadata}));
+        const auto bytes =
+            MasterMetricManager::instance().get_allocated_file_size();
+        metadata.transport_endpoint = endpoint;
+        ASSERT_TRUE(service.NotifyOffloadSuccess(new_owner, tasks, {metadata}));
+        ASSERT_TRUE(service.NotifyOffloadSuccess(new_owner, tasks, {metadata}));
+        EXPECT_EQ(LocalDiskUsedBytes(service, old_owner), 128);
+        EXPECT_EQ(LocalDiskUsedBytes(service, new_owner), 128);
+        EXPECT_EQ(MasterMetricManager::instance().get_allocated_file_size(),
+                  bytes + 128);
+        auto list = service.GetReplicaList("restart", TenantId::Default());
+        ASSERT_TRUE(list);
+        ASSERT_EQ(list->replicas.size(), 2);
+        ASSERT_TRUE(service.UnmountLocalDiskSegment(old_owner));
+        list = service.GetReplicaList("restart", TenantId::Default());
+        ASSERT_TRUE(list);
+        ASSERT_EQ(list->replicas.size(), 1);
+        EXPECT_EQ(list->replicas[0].get_local_disk_descriptor().client_id,
+                  new_owner);
+        EXPECT_EQ(LocalDiskUsedBytes(service, new_owner), 128);
+        EXPECT_EQ(MasterMetricManager::instance().get_allocated_file_size(),
+                  bytes);
+        auto late = service.NotifyOffloadSuccess(old_owner, tasks, {metadata});
+        ASSERT_FALSE(late);
+        EXPECT_EQ(late.error(), ErrorCode::SEGMENT_NOT_FOUND);
+        ASSERT_TRUE(service.UnmountLocalDiskSegment(new_owner));
+        EXPECT_EQ(service.GetKeyCount(), 0);
+    }
+}
+
+TEST_F(MasterServiceTenantQuotaTest, SsdSameOwnerRefreshesDescriptorAndUsage) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_offload(true).build());
+    const UUID owner{32, 1};
+    ASSERT_TRUE(service.MountLocalDiskSegment(owner, true));
+    std::vector<OffloadTaskItem> tasks{
+        {std::string(TenantId::kDefaultValue), "refresh", 128}};
+    StorageObjectMetadata metadata{};
+    metadata.data_size = 128;
+    metadata.transport_endpoint = "old:50052";
+    ASSERT_TRUE(service.NotifyOffloadSuccess(owner, tasks, {metadata}));
+    auto initial = service.GetReplicaList("refresh", TenantId::Default());
+    ASSERT_TRUE(initial);
+    const auto id = initial->replicas[0].id;
+    const auto bytes =
+        MasterMetricManager::instance().get_allocated_file_size();
+    for (uint64_t stale : {64, 256}) {
+        SetStaleDiskSize(service, owner, "refresh", stale);
+        metadata.transport_endpoint = "new:50052";
+        ASSERT_TRUE(service.NotifyOffloadSuccess(owner, tasks, {metadata}));
+        EXPECT_EQ(LocalDiskUsedBytes(service, owner), 128);
+        EXPECT_EQ(MasterMetricManager::instance().get_allocated_file_size(),
+                  bytes);
+        auto list = service.GetReplicaList("refresh", TenantId::Default());
+        ASSERT_TRUE(list);
+        ASSERT_EQ(list->replicas.size(), 1);
+        EXPECT_EQ(list->replicas[0].id, id);
+        EXPECT_EQ(list->replicas[0].get_local_disk_descriptor().object_size,
+                  128);
+        EXPECT_EQ(
+            list->replicas[0].get_local_disk_descriptor().transport_endpoint,
+            "new:50052");
+    }
+    metadata.data_size = 129;
+    auto mismatch = service.NotifyOffloadSuccess(owner, tasks, {metadata});
+    ASSERT_FALSE(mismatch);
+    EXPECT_EQ(mismatch.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(LocalDiskUsedBytes(service, owner), 128);
+    ASSERT_TRUE(service.UnmountLocalDiskSegment(owner));
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_file_size(),
+              bytes - 128);
+}
+
+TEST_F(MasterServiceTenantQuotaTest, SsdPendingCompletionRegistersSecondOwner) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_offload(true).build());
+    UUID owner = MountSegment(service);
+    const UUID old_owner{33, 1};
+    ASSERT_TRUE(service.MountLocalDiskSegment(owner, true));
+    ASSERT_TRUE(service.MountLocalDiskSegment(old_owner, true));
+    PutComplete(service, owner, "pending", TenantId::Default(), 128);
+    ASSERT_EQ(PendingOffloads(service, "pending"), 1);
+    AddCompletedDiskReplica(service, old_owner, "pending", TenantId::Default(),
+                            128);
+    StorageObjectMetadata metadata{};
+    metadata.data_size = 128;
+    metadata.transport_endpoint = "new:50052";
+    std::vector<OffloadTaskItem> tasks{
+        {std::string(TenantId::kDefaultValue), "pending", 128}};
+    ASSERT_TRUE(service.NotifyOffloadSuccess(owner, tasks, {metadata}));
+    EXPECT_EQ(PendingOffloads(service, "pending"), 0);
+    ASSERT_TRUE(service.NotifyOffloadSuccess(owner, tasks, {metadata}));
+    EXPECT_EQ(LocalDiskUsedBytes(service, owner), 128);
+    ASSERT_TRUE(service.UnmountLocalDiskSegment(old_owner));
+    auto list = service.GetReplicaList("pending", TenantId::Default());
+    ASSERT_TRUE(list);
+    ASSERT_EQ(list->replicas.size(), 2);
 }
 
 }  // namespace mooncake::test

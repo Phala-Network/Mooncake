@@ -495,6 +495,20 @@ class Replica {
         return std::nullopt;
     }
 
+    // get_descriptor() returns a copy; updates must touch the owned data.
+    void update_local_disk_location(std::string endpoint,
+                                    uint64_t object_size) {
+        auto& disk = std::get<LocalDiskReplicaData>(data_);
+        if (disk.object_size != object_size) {
+            MasterMetricManager::instance().dec_allocated_file_size(
+                disk.object_size);
+            MasterMetricManager::instance().inc_allocated_file_size(
+                object_size);
+        }
+        disk.transport_endpoint = std::move(endpoint);
+        disk.object_size = object_size;
+    }
+
     [[nodiscard]] size_t get_memory_buffer_size() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);

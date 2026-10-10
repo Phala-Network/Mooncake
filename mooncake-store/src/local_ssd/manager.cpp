@@ -207,6 +207,17 @@ bool LocalSsdManager::AdjustUsedBytes(const UUID& client_id, int64_t delta) {
     return true;
 }
 
+tl::expected<void, ErrorCode> LocalSsdManager::ApplyUsageTransition(
+    const UUID& client_id,
+    const std::function<tl::expected<void, ErrorCode>(const UsageCommit&)>&
+        transition) {
+    auto client = FindClient(client_id);
+    if (!client) return tl::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    return transition([&](int64_t delta) {
+        client->record->used_bytes.fetch_add(delta, std::memory_order_relaxed);
+    });
+}
+
 ErrorCode LocalSsdManager::EnqueueOffload(const UUID& client_id,
                                           OffloadTaskItem task, size_t limit) {
     auto client = FindClient(client_id);
