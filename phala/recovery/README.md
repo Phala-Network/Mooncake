@@ -9,3 +9,11 @@ One image derives from the pinned SGLang phala-3 base, retaining its SGLang/PIG 
 5. Run the isolated restart and rail fixtures before any authorized production rollout. CUDA/RDMA execution and full service stability are separate acceptance gates; import success is not GPU validation.
 
 No global LD_LIBRARY_PATH changes, driver stubs, Python package reinstall, model arguments or service configuration changes are included. Production must not select optional Mooncake EP/PG paths until those separately receive the recovery patch and validation.
+
+## SSD eviction reader windows (recovery-2)
+
+PrepareEviction now releases the metadata lock between complete bucket transitions and copies notification keys outside it. A prepare-only mutex preserves admission ordering; pending keys and bytes stay reserved before each reader window. Physical-space credits apply only to buckets visible at the initial snapshot, preventing newly committed buckets from incorrectly reducing that snapshot.
+
+The exact two-file v2 candidate passed 24 deterministic CPU test instances and 14 adjacent safety regressions without instrumentation. Controls reproduced reader blocking with both buffered and direct I/O, and reproduced an unsafe physical credit in the rejected v1 candidate. A 400,000-key CPU fixture reduced the first queued reader's wait from 388–481 ms to 1.14–1.75 ms. This is not a production latency guarantee or a throughput result.
+
+Physical scans, large buckets, Commit, Restore and shared-mutex fairness remain possible sources of latency. The production 13.783-second event was not reproduced in this fixture. Keep the restore-buffer TTL and lease checks unchanged; deployment must preserve SSD data and verify actual eviction/read behavior. Production validation is separate from these source tests.

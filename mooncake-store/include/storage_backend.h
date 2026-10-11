@@ -1223,6 +1223,10 @@ class BucketStorageBackend : public StorageBackendInterface {
      * - total_size_: cumulative data size of all stored objects
      */
     mutable SharedMutex mutex_;
+    // Prepare-only serialization. Lock order: eviction_prepare_mutex_, then
+    // mutex_. No holder of mutex_ may acquire eviction_prepare_mutex_, and
+    // notification/Commit/Restore/Finalize never acquire this mutex.
+    Mutex eviction_prepare_mutex_;
     mutable Mutex iterator_mutex_;
     std::string storage_path_;
     int64_t total_size_ GUARDED_BY(mutex_) = 0;
