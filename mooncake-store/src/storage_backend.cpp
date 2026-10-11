@@ -2981,6 +2981,11 @@ tl::expected<BucketStorageBackend::PendingEviction, ErrorCode>
 BucketStorageBackend::PrepareEviction(
     int64_t required_size, const std::vector<std::string>& write_keys) {
     PendingEviction result;
+    // Destroy the physical snapshot set after both locks have been released.
+    std::unordered_set<int64_t> physical_snapshot_bucket_ids;
+    // Preserve Prepare-to-Prepare admission/snapshot ordering while allowing
+    // readers between bucket transitions. Never hold this across callbacks.
+    MutexLocker prepare_lock(&eviction_prepare_mutex_);
     SharedMutexLocker lock(&mutex_);
 
     if (!write_keys.empty()) {
@@ -3072,8 +3077,19 @@ BucketStorageBackend::PrepareEviction(
                    bucket_backend_config_.max_physical_bytes;
     };
 
+    // Only entry-visible buckets may reduce this round's physical snapshot.
+    // A write can finish and become visible during a reader window; its files
+    // may not have existed in physical_used_start or initial free space.
+    if (bucket_backend_config_.max_physical_bytes > 0 || initial_disk_full) {
+        physical_snapshot_bucket_ids.reserve(buckets_.size());
+        for (const auto& [id, meta] : buckets_) {
+            physical_snapshot_bucket_ids.insert(id);
+        }
+    }
+
     while (!buckets_.empty() && evict_count < kMaxEvictionBuckets) {
-        bool quota_exceeded = total_size_ + pending_eviction_size_ +
+        bool quota_exceeded = total_size_ + pending_eviction_size_ -
+                                  result.evicted_size +
                                   pending_write_size_ +
                                   synthetic_required_size >
                               bucket_backend_config_.max_total_size;
@@ -3121,19 +3137,36 @@ BucketStorageBackend::PrepareEviction(
         total_size_ -= evict_meta->meta_size;
         result.evicted_size += evicted_size;
 
-        // Collect for notification and file deletion.
+        // Complete duplicate-key protection and rollback-space reservation
+        // before exposing the next reader window. Other transactions count
+        // all pending bytes; this transaction discounts only its own bytes
+        // in quota_exceeded above/below because they are its selected victims.
         for (const auto& key : evict_meta->keys) {
             pending_eviction_keys_.insert(key);
-            result.keys.push_back(key);
         }
-        accumulated_freed_space +=
-            static_cast<uint64_t>(evict_meta->data_size) +
-            static_cast<uint64_t>(evict_meta->meta_size);
+        pending_eviction_size_ += evicted_size;
+        if (physical_snapshot_bucket_ids.count(evict_id) != 0) {
+            accumulated_freed_space +=
+                static_cast<uint64_t>(evict_meta->data_size) +
+                static_cast<uint64_t>(evict_meta->meta_size);
+        }
         result.buckets.emplace_back(evict_id, std::move(evict_meta));
         evict_count++;
+
+        // This complete bucket is detached from both indexes and protected
+        // by pending_eviction_keys_/size_. Its immutable key vector belongs
+        // to result, so notification-key copies do not need the metadata lock.
+        // Existing BucketReadGuards still own the files until FinalizeEviction.
+        lock.unlock();
+        const auto& evicted_keys = result.buckets.back().second->keys;
+        result.keys.insert(result.keys.end(), evicted_keys.begin(),
+                           evicted_keys.end());
+        std::this_thread::yield();
+        lock.lock();
     }
 
-    const bool quota_exceeded = total_size_ + pending_eviction_size_ +
+    const bool quota_exceeded = total_size_ + pending_eviction_size_ -
+                                    result.evicted_size +
                                     pending_write_size_ +
                                     synthetic_required_size >
                                 bucket_backend_config_.max_total_size;
@@ -3141,7 +3174,6 @@ BucketStorageBackend::PrepareEviction(
     // reject the write (FILE_WRITE_FAIL, handled as an offload miss upstream)
     // rather than overrun the disk quota and get OOM-evicted.
     const bool phys_exceeded = phys_over_cap(accumulated_freed_space);
-    pending_eviction_size_ += result.evicted_size;
     if (!write_keys.empty() && (quota_exceeded || phys_exceeded)) {
         RestorePreparedEvictionLocked(std::move(result));
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);

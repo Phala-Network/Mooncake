@@ -11,7 +11,7 @@ ARG MOONCAKE_RELEASE
 LABEL io.phala.mooncake.revision=$MOONCAKE_REVISION \
       io.phala.mooncake.source="https://github.com/Phala-Network/Mooncake" \
       io.phala.mooncake.release=$MOONCAKE_RELEASE \
-      io.phala.mooncake.change="owner re-registration, rail recovery and direct SSD writes"
+      io.phala.mooncake.change="owner re-registration, rail recovery, direct SSD writes and eviction reader windows"
 # Inherit SGLang/PIG identity, command, entrypoint and configuration from phala-3.
 COPY phala/recovery/artifacts/runtime/ /opt/sglang/lib/python3.12/site-packages/mooncake/
 COPY phala/recovery/verify-runtime.py /opt/phala/verify-mooncake-recovery.py
