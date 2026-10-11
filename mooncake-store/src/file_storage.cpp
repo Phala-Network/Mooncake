@@ -11,6 +11,7 @@
 #include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
 #include "utils.h"
+#include "utils/disk_eviction_error_summary.h"
 #include "device/accelerator_registry.h"
 #ifdef USE_URING
 #include "file_interface.h"
@@ -588,23 +589,19 @@ tl::expected<void, ErrorCode> FileStorage::NotifyEvictedDiskReplicas(
             continue;
         }
 
+        DiskEvictionErrorSummary errors;
         for (size_t i = 0; i < results.size(); ++i) {
             if (!results[i]) {
+                errors.Record(results[i].error(), i);
                 if (results[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
-                    VLOG(1)
-                        << "Master no longer tracks evicted local disk key: "
-                        << keys[i] << ", tenant_id=" << tenant_id;
                     continue;
                 }
                 if (!first_error.has_value()) {
                     first_error = results[i].error();
                 }
-                LOG(WARNING)
-                    << "Failed to notify master about evicted local disk key: "
-                    << keys[i] << ", tenant_id=" << tenant_id
-                    << ", error: " << results[i].error();
             }
         }
+        errors.Log("NotifyEvictedDiskReplicas", keys.size());
     }
     if (first_error.has_value()) {
         return tl::make_unexpected(first_error.value());

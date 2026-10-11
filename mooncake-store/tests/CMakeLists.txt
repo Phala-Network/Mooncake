@@ -328,3 +328,5 @@ foreach(
   ordered_oplog_writer_test)
   target_link_libraries(${target} PRIVATE Mooncake::xxhash)
 endforeach()
+
+add_store_test(disk_eviction_logging_test disk_eviction_logging_test.cpp)

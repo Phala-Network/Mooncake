@@ -13,6 +13,7 @@
 #include "rpc_helper.h"
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
+#include "utils/disk_eviction_error_summary.h"
 #include "version.h"
 
 namespace mooncake {
@@ -1326,14 +1327,14 @@ WrappedMasterService::BatchEvictDiskReplica(
         });
 
     size_t failure_count = 0;
+    DiskEvictionErrorSummary errors;
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
             failure_count++;
-            LOG(WARNING) << "BatchEvictDiskReplica failed for key[" << i
-                         << "] '" << keys[i]
-                         << "': " << toString(results[i].error());
+            errors.Record(results[i].error(), i);
         }
     }
+    errors.Log("BatchEvictDiskReplica", total_keys);
     if (failure_count > 0) {
         MasterMetricManager::instance().inc_evict_disk_replica_failures();
     }

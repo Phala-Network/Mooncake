@@ -1798,24 +1798,9 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     }
     PendingEviction pending = std::move(prepare_result.value());
 
-    // Notify master about evicted keys BEFORE touching the files.
-    if (eviction_handler && !pending.keys.empty()) {
-        auto notify_result = eviction_handler(pending.keys);
-        if (!notify_result) {
-            RestorePreparedEviction(std::move(pending));
-            return tl::make_unexpected(notify_result.error());
-        }
-    }
-    CommitPreparedEviction(pending);
-
-    // Phase 2: delete evicted files NOW, before writing the new bucket, so
-    // that the freed disk space is available for the incoming write.
-    auto finalize_result = FinalizeEviction(pending);
-    if (!finalize_result) {
-        LOG(ERROR)
-            << "FinalizeEviction failed after master committed eviction; "
-               "continuing BatchOffload: "
-            << finalize_result.error();
+    auto complete_result = CompletePreparedEviction(pending, eviction_handler);
+    if (!complete_result) {
+        return tl::make_unexpected(complete_result.error());
     }
 
     auto write_bucket_result = WriteBucket(bucket_id, bucket, iovs);
@@ -2881,13 +2866,17 @@ void BucketStorageBackend::RollbackCommittedBucket(
 }
 
 std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
-BucketStorageBackend::SelectEvictionCandidate() {
+BucketStorageBackend::SelectEvictionCandidate(
+    const std::unordered_set<int64_t>& skipped) {
     // Must be called with mutex_ held (exclusive).
     switch (bucket_backend_config_.eviction_policy) {
         case BucketEvictionPolicy::FIFO:
             // buckets_ is ordered by bucket_id (monotonically increasing),
             // so begin() is always the oldest bucket.
-            return buckets_.begin();
+            for (auto it = buckets_.begin(); it != buckets_.end(); ++it) {
+                if (skipped.count(it->first) == 0) return it;
+            }
+            return buckets_.end();
 
         case BucketEvictionPolicy::LRU:
             // Use lru_index_ (a std::set ordered by {last_access_ns_,
@@ -2902,6 +2891,11 @@ BucketStorageBackend::SelectEvictionCandidate() {
             //   - If the bucket no longer exists, discard the entry.
             while (!lru_index_.empty()) {
                 auto top_it = lru_index_.begin();
+                while (top_it != lru_index_.end() &&
+                       skipped.count(top_it->second) != 0) {
+                    ++top_it;
+                }
+                if (top_it == lru_index_.end()) return buckets_.end();
                 auto [ts, id] = *top_it;
                 auto bucket_it = buckets_.find(id);
                 if (bucket_it == buckets_.end()) {
@@ -3046,6 +3040,10 @@ BucketStorageBackend::PrepareEviction(
     }
 
     size_t evict_count = 0;
+    size_t candidates_left = buckets_.size();
+    std::unordered_set<int64_t> skipped;
+    constexpr size_t kMaxNotificationKeys = 1024;
+    constexpr size_t kMaxNotificationKeyBytes = 1024 * 1024;
     constexpr size_t kMaxEvictionBuckets = 1000;
     uint64_t accumulated_freed_space = 0;
     const int64_t synthetic_required_size =
@@ -3087,10 +3085,10 @@ BucketStorageBackend::PrepareEviction(
         }
     }
 
-    while (!buckets_.empty() && evict_count < kMaxEvictionBuckets) {
+    while (!buckets_.empty() && evict_count < kMaxEvictionBuckets &&
+           candidates_left-- > 0) {
         bool quota_exceeded = total_size_ + pending_eviction_size_ -
-                                  result.evicted_size +
-                                  pending_write_size_ +
+                                  result.evicted_size + pending_write_size_ +
                                   synthetic_required_size >
                               bucket_backend_config_.max_total_size;
 
@@ -3113,15 +3111,44 @@ BucketStorageBackend::PrepareEviction(
                       << " disk_full=" << initial_disk_full;
         }
 
-        auto evict_it = SelectEvictionCandidate();
+        auto evict_it = SelectEvictionCandidate(skipped);
         if (evict_it == buckets_.end()) break;
+
+        // Never split a physical bucket across acknowledged/unacknowledged
+        // callbacks. Oversized historical buckets stay readable; skip them
+        // so a large oldest bucket does not block eligible followers.
+        size_t key_bytes = 0;
+        bool oversized = evict_it->second->keys.size() > kMaxNotificationKeys;
+        for (const auto& key : evict_it->second->keys) {
+            if (oversized ||
+                key.size() > kMaxNotificationKeyBytes - key_bytes) {
+                oversized = true;
+                break;
+            }
+            key_bytes += key.size();
+        }
+        if (oversized) {
+            skipped.insert(evict_it->first);
+            if (bucket_backend_config_.eviction_policy ==
+                BucketEvictionPolicy::LRU) {
+                lru_index_.emplace(evict_it->second->last_access_ns_.load(
+                                       std::memory_order_relaxed),
+                                   evict_it->first);
+            }
+            lock.unlock();
+            std::this_thread::yield();
+            lock.lock();
+            continue;
+        }
 
         int64_t evict_id = evict_it->first;
         std::shared_ptr<BucketMetadata> evict_meta =
             std::move(evict_it->second);
         buckets_.erase(evict_it);
 
-        int64_t evicted_size = evict_meta->meta_size;
+        PendingBucket pending_bucket{
+            evict_id, evict_meta, {}, evict_meta->meta_size};
+        auto& evicted_size = pending_bucket.evicted_size;
         // Remove all keys belonging to this bucket from the object map.
         for (const auto& key : evict_meta->keys) {
             auto obj_it = object_bucket_map_.find(key);
@@ -3131,6 +3158,7 @@ BucketStorageBackend::PrepareEviction(
                     obj_it->second.data_size + obj_it->second.key_size;
                 total_size_ -= object_size;
                 evicted_size += object_size;
+                pending_bucket.objects.emplace_back(key, obj_it->second);
                 object_bucket_map_.erase(obj_it);
             }
         }
@@ -3150,24 +3178,20 @@ BucketStorageBackend::PrepareEviction(
                 static_cast<uint64_t>(evict_meta->data_size) +
                 static_cast<uint64_t>(evict_meta->meta_size);
         }
-        result.buckets.emplace_back(evict_id, std::move(evict_meta));
+        result.buckets.push_back(std::move(pending_bucket));
         evict_count++;
 
         // This complete bucket is detached from both indexes and protected
-        // by pending_eviction_keys_/size_. Its immutable key vector belongs
-        // to result, so notification-key copies do not need the metadata lock.
+        // by pending_eviction_keys_/size_. Notify directly from its immutable
+        // key vector, without a second flat copy of all pending keys.
         // Existing BucketReadGuards still own the files until FinalizeEviction.
         lock.unlock();
-        const auto& evicted_keys = result.buckets.back().second->keys;
-        result.keys.insert(result.keys.end(), evicted_keys.begin(),
-                           evicted_keys.end());
         std::this_thread::yield();
         lock.lock();
     }
 
     const bool quota_exceeded = total_size_ + pending_eviction_size_ -
-                                    result.evicted_size +
-                                    pending_write_size_ +
+                                    result.evicted_size + pending_write_size_ +
                                     synthetic_required_size >
                                 bucket_backend_config_.max_total_size;
     // Physical cap still exceeded after evicting up to kMaxEvictionBuckets:
@@ -3175,13 +3199,13 @@ BucketStorageBackend::PrepareEviction(
     // rather than overrun the disk quota and get OOM-evicted.
     const bool phys_exceeded = phys_over_cap(accumulated_freed_space);
     if (!write_keys.empty() && (quota_exceeded || phys_exceeded)) {
-        RestorePreparedEvictionLocked(std::move(result));
+        lock.unlock();
+        RestorePreparedEviction(std::move(result));
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
     if (!result.buckets.empty()) {
         LOG(INFO) << "[Evict] prepared: buckets=" << result.buckets.size()
-                  << " keys=" << result.keys.size()
                   << " total_after=" << total_size_;
     }
 
@@ -3189,55 +3213,67 @@ BucketStorageBackend::PrepareEviction(
 }
 
 void BucketStorageBackend::RestorePreparedEviction(PendingEviction&& pending) {
-    SharedMutexLocker lock(&mutex_);
-    RestorePreparedEvictionLocked(std::move(pending));
+    for (auto& bucket : pending.buckets) {
+        if (!bucket.metadata) continue;  // Already acknowledged and finalized.
+        {
+            SharedMutexLocker lock(&mutex_);
+            CHECK_GE(pending_eviction_size_, bucket.evicted_size);
+            pending_eviction_size_ -= bucket.evicted_size;
+            for (const auto& key : bucket.metadata->keys) {
+                pending_eviction_keys_.erase(key);
+            }
+            CHECK(buckets_.find(bucket.id) == buckets_.end());
+            for (auto& [key, object] : bucket.objects) {
+                object_bucket_map_.emplace(std::move(key), std::move(object));
+            }
+            total_size_ += bucket.evicted_size;
+            if (bucket_backend_config_.eviction_policy ==
+                BucketEvictionPolicy::LRU) {
+                lru_index_.emplace(bucket.metadata->last_access_ns_.load(
+                                       std::memory_order_relaxed),
+                                   bucket.id);
+            }
+            buckets_.emplace(bucket.id, std::move(bucket.metadata));
+        }
+        // The complete bucket is visible and its P-to-L transfer is atomic.
+        // Incoming W remains reserved until all rollback buckets are visible.
+        std::this_thread::yield();
+    }
+    ReleasePreparedWrite(pending);
 }
 
-void BucketStorageBackend::RestorePreparedEvictionLocked(
-    PendingEviction&& pending) {
-    ReleasePreparedWriteLocked(pending);
-
-    CHECK_GE(pending_eviction_size_, pending.evicted_size);
-    pending_eviction_size_ -= pending.evicted_size;
-    for (const auto& key : pending.keys) {
+void BucketStorageBackend::CommitPreparedEviction(const PendingBucket& bucket) {
+    SharedMutexLocker lock(&mutex_);
+    CHECK_GE(pending_eviction_size_, bucket.evicted_size);
+    pending_eviction_size_ -= bucket.evicted_size;
+    for (const auto& key : bucket.metadata->keys) {
         pending_eviction_keys_.erase(key);
-    }
-    for (auto& [bucket_id, bucket_meta] : pending.buckets) {
-        if (!bucket_meta || buckets_.find(bucket_id) != buckets_.end()) {
-            continue;
-        }
-
-        for (size_t i = 0; i < bucket_meta->keys.size(); ++i) {
-            const auto& key = bucket_meta->keys[i];
-            const auto& object_meta = bucket_meta->metadatas[i];
-            object_bucket_map_[key] = StorageObjectMetadata{
-                bucket_id, object_meta.offset, object_meta.key_size,
-                object_meta.data_size, ""};
-            total_size_ += object_meta.data_size + object_meta.key_size;
-        }
-        total_size_ += bucket_meta->meta_size;
-        if (bucket_backend_config_.eviction_policy ==
-            BucketEvictionPolicy::LRU) {
-            lru_index_.emplace(
-                bucket_meta->last_access_ns_.load(std::memory_order_relaxed),
-                bucket_id);
-        }
-        buckets_.emplace(bucket_id, std::move(bucket_meta));
     }
 }
 
-void BucketStorageBackend::CommitPreparedEviction(
-    const PendingEviction& pending) {
-    if (pending.evicted_size == 0) {
-        return;
+tl::expected<void, ErrorCode> BucketStorageBackend::CompletePreparedEviction(
+    PendingEviction& pending, const EvictionHandler& eviction_handler) {
+    for (auto& bucket : pending.buckets) {
+        if (eviction_handler && !bucket.metadata->keys.empty()) {
+            auto notified = eviction_handler(bucket.metadata->keys);
+            if (!notified) {
+                RestorePreparedEviction(std::move(pending));
+                return tl::make_unexpected(notified.error());
+            }
+        }
+        CommitPreparedEviction(bucket);
+        auto finalized = FinalizeEviction(bucket);
+        if (!finalized) {
+            LOG(ERROR)
+                << "FinalizeEviction failed after master committed eviction: "
+                << finalized.error();
+        }
+        // Never roll back a bucket whose callback returned success, even if
+        // file cleanup failed or a later bucket notification fails.
+        bucket.metadata.reset();
+        bucket.objects.clear();
     }
-
-    SharedMutexLocker lock(&mutex_);
-    CHECK_GE(pending_eviction_size_, pending.evicted_size);
-    pending_eviction_size_ -= pending.evicted_size;
-    for (const auto& key : pending.keys) {
-        pending_eviction_keys_.erase(key);
-    }
+    return {};
 }
 
 void BucketStorageBackend::ReleasePreparedWrite(
@@ -3260,14 +3296,16 @@ void BucketStorageBackend::ReleasePreparedWriteLocked(
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
-    const PendingEviction& pending) {
+    const PendingBucket& bucket) {
     namespace fs = std::filesystem;
 
     constexpr int kMaxSpinIterations = 1000;
     constexpr auto kMaxWaitTime = std::chrono::seconds(10);
     size_t cleanup_failed_count = 0;
 
-    for (const auto& [bucket_id, bucket_meta] : pending.buckets) {
+    const auto bucket_id = bucket.id;
+    const auto& bucket_meta = bucket.metadata;
+    do {
         bool bucket_cleanup_failed = false;
 
         // The master has already committed the replica removal. Attempt to
@@ -3340,10 +3378,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
         }
         VLOG(1) << "Evicted bucket with id: " << bucket_id
                 << ", policy: " << bucket_backend_config_.eviction_policy;
-    }
-    if (!pending.buckets.empty()) {
-        LOG(INFO) << "[Evict] finalized: attempted=" << pending.buckets.size()
-                  << " cleanup_failed=" << cleanup_failed_count;
+    } while (false);
+    {
+        VLOG(1) << "[Evict] finalized: attempted=1"
+                << " cleanup_failed=" << cleanup_failed_count;
         // Files were just deleted; force the next physical-usage query to
         // rescan rather than return the now-stale (higher) cached value.
         {
@@ -3391,22 +3429,14 @@ BucketStorageBackend::EvictAboveDiskWatermark(
         return tl::make_unexpected(prepare_result.error());
     }
     PendingEviction pending = std::move(prepare_result.value());
-    evicted_keys = pending.keys;
-
-    if (eviction_handler && !pending.keys.empty()) {
-        auto notify_result = eviction_handler(pending.keys);
-        if (!notify_result) {
-            RestorePreparedEviction(std::move(pending));
-            return tl::make_unexpected(notify_result.error());
-        }
+    for (const auto& bucket : pending.buckets) {
+        evicted_keys.insert(evicted_keys.end(), bucket.metadata->keys.begin(),
+                            bucket.metadata->keys.end());
     }
-    CommitPreparedEviction(pending);
-    auto finalize_result = FinalizeEviction(pending);
-    if (!finalize_result) {
-        LOG(ERROR)
-            << "FinalizeEviction failed after master committed eviction; "
-               "returning evicted keys: "
-            << finalize_result.error();
+
+    auto complete_result = CompletePreparedEviction(pending, eviction_handler);
+    if (!complete_result) {
+        return tl::make_unexpected(complete_result.error());
     }
     return evicted_keys;
 }

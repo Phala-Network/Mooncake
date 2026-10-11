@@ -5523,9 +5523,9 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
-        LOG(INFO) << "key=" << key
-                  << ", tenant_id=" << object_id.tenant_id.value()
-                  << ", info=object_not_found_for_eviction";
+        // Missing metadata is expected during idempotent eviction/recovery.
+        // The batch RPC boundary aggregates diagnostics outside this shard
+        // lock.
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
@@ -5533,8 +5533,6 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
 
     if (replica_type != ReplicaType::DISK &&
         replica_type != ReplicaType::LOCAL_DISK) {
-        LOG(ERROR) << "key=" << key
-                   << ", error=invalid_replica_type_for_eviction";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 

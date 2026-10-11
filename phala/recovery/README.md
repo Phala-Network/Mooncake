@@ -17,3 +17,34 @@ PrepareEviction now releases the metadata lock between complete bucket transitio
 The exact two-file v2 candidate passed 24 deterministic CPU test instances and 14 adjacent safety regressions without instrumentation. Controls reproduced reader blocking with both buffered and direct I/O, and reproduced an unsafe physical credit in the rejected v1 candidate. A 400,000-key CPU fixture reduced the first queued reader's wait from 388–481 ms to 1.14–1.75 ms. This is not a production latency guarantee or a throughput result.
 
 Physical scans, large buckets, Commit, Restore and shared-mutex fairness remain possible sources of latency. The production 13.783-second event was not reproduced in this fixture. Keep the restore-buffer TTL and lease checks unchanged; deployment must preserve SSD data and verify actual eviction/read behavior. Production validation is separate from these source tests.
+
+## Bounded Bucket eviction and HA recovery
+
+Bucket eviction now notifies and commits one complete bucket at a time. A later
+notification failure restores only unacknowledged buckets, preserving completed
+deletions, incoming-write reservations and read-guard ownership. Commit and
+Restore release the metadata lock between buckets. Rollback restores exactly the
+objects removed during Prepare, so previously deleted keys are not resurrected.
+Master and owner eviction errors are aggregated by error code instead of logged
+once per key while holding metadata locks.
+
+Automatic eviction admits buckets with at most 1024 keys and 1 MiB of aggregate
+key bytes. Larger legacy buckets remain readable and are skipped without
+blocking eligible followers; oversized-only storage can reject writes and needs
+migration. This byte budget is a compatibility boundary, not a universal key
+length restriction. Physical filesystem scans, lazy LRU repair and mutex fairness
+remain outside this repair; bounded operations do not establish a latency SLA.
+
+For HA SDK consumers and owners, the official `MC_RPC_CONNECT_TIMEOUT_MS` and
+`MC_RPC_TIMEOUT_MS` settings limit individual connection/request attempts. Pool
+retries and compound SDK operations can exceed those individual limits. Set the
+variables in each client process; a master-server environment does not configure
+its clients. Native calls must really return before registered buffers are freed
+or reused. A Python future timeout is not transport cancellation. The existing
+ReMountSegment lock-order fix also keeps unrelated client Ping calls responsive
+while a remount waits for the snapshot barrier.
+
+Tests cover failed notifications, partial success, capacity accounting,
+oversized buckets, concurrent metadata readers and guarded file cleanup. Real
+leader transitions, final image identity and GPU/RDMA acceptance remain separate
+release gates; do not infer them from CPU unit tests.

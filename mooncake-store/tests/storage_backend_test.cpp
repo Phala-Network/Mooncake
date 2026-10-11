@@ -5500,3 +5500,210 @@ TEST_F(StorageBackendTest, BucketBatchLoadRejectsShortRead) {
 #endif
 
 }  // namespace mooncake::test
+
+namespace mooncake::test {
+namespace {
+auto BoundedComplete = [](const std::vector<std::string>&,
+                          std::vector<StorageObjectMetadata>&) {
+    return ErrorCode::OK;
+};
+
+tl::expected<int64_t, ErrorCode> BoundedPut(
+    BucketStorageBackend& backend, const std::vector<std::string>& keys,
+    size_t value_size = 16,
+    StorageBackendInterface::EvictionHandler handler = nullptr) {
+    std::string value(value_size, 'v');
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    for (const auto& key : keys) {
+        batch.emplace(key, std::vector<Slice>{{value.data(), value.size()}});
+    }
+    return backend.BatchOffload(batch, BoundedComplete, std::move(handler));
+}
+
+BucketBackendConfig BoundedConfig() {
+    BucketBackendConfig config;
+    config.bucket_keys_limit = 2000;
+    config.bucket_size_limit = 32 * 1024 * 1024;
+    config.max_total_size = 1024 * 1024 * 1024;
+    config.eviction_policy = BucketEvictionPolicy::FIFO;
+    return config;
+}
+
+void BoundedExists(BucketStorageBackend& backend, const std::string& key,
+                   bool expected) {
+    auto found = backend.IsExist(key);
+    ASSERT_TRUE(found);
+    EXPECT_EQ(*found, expected);
+}
+}  // namespace
+
+TEST_F(StorageBackendTest, BoundedNotification150000KeysTimeoutRestoresAll) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, BoundedConfig());
+    ASSERT_TRUE(backend.Init());
+    for (int bucket = 0; bucket < 300; ++bucket) {
+        std::vector<std::string> keys;
+        for (int i = 0; i < 500; ++i) {
+            keys.push_back("bounded_" + std::to_string(bucket) + "_" +
+                           std::to_string(i));
+        }
+        ASSERT_TRUE(BoundedPut(backend, keys));
+    }
+    size_t calls = 0;
+    auto result = backend.EvictAboveDiskWatermark(
+        0, 0,
+        [&](const std::vector<std::string>& keys)
+            -> tl::expected<void, ErrorCode> {
+            ++calls;
+            EXPECT_LE(keys.size(), 1024U);
+            size_t bytes = 0;
+            for (const auto& key : keys) bytes += key.size();
+            EXPECT_LE(bytes, 1024U * 1024U);
+            return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+        });
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::RPC_TIMEOUT);
+    EXPECT_EQ(calls, 1U);
+    for (int bucket = 0; bucket < 300; ++bucket) {
+        BoundedExists(backend, "bounded_" + std::to_string(bucket) + "_0",
+                      true);
+        BoundedExists(backend, "bounded_" + std::to_string(bucket) + "_499",
+                      true);
+    }
+}
+
+TEST_F(StorageBackendTest,
+       BoundedSecondFailureDoesNotRestoreAcknowledgedBucket) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, BoundedConfig());
+    ASSERT_TRUE(backend.Init());
+    for (const auto& key : {"first", "second", "third"}) {
+        ASSERT_TRUE(BoundedPut(backend, {key}));
+    }
+    int calls = 0;
+    auto result = backend.EvictAboveDiskWatermark(
+        0, 0,
+        [&](const std::vector<std::string>& keys)
+            -> tl::expected<void, ErrorCode> {
+            ++calls;
+            EXPECT_EQ(keys.size(), 1U);
+            if (calls == 2) return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+            return {};
+        });
+    ASSERT_FALSE(result);
+    EXPECT_EQ(calls, 2);
+    BoundedExists(backend, "first", false);
+    BoundedExists(backend, "second", true);
+    BoundedExists(backend, "third", true);
+    // A confirmed key can be reused, while rolled-back keys stay protected.
+    EXPECT_TRUE(BoundedPut(backend, {"first"}));
+    auto duplicate = BoundedPut(backend, {"second"});
+    ASSERT_FALSE(duplicate);
+    EXPECT_EQ(duplicate.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+    std::vector<std::string> notified;
+    auto retry = backend.EvictAboveDiskWatermark(
+        0, 0, [&](const auto& keys) -> tl::expected<void, ErrorCode> {
+            notified.insert(notified.end(), keys.begin(), keys.end());
+            return {};
+        });
+    ASSERT_TRUE(retry);
+    EXPECT_EQ(*retry, notified);
+    EXPECT_EQ(notified.size(), 3U);
+}
+
+TEST_F(StorageBackendTest, BoundedOversizedKeyCountSkipsOldestForFifoAndLru) {
+    for (const auto policy :
+         {BucketEvictionPolicy::FIFO, BucketEvictionPolicy::LRU}) {
+        FileStorageConfig config;
+        config.storage_filepath =
+            data_path +
+            (policy == BucketEvictionPolicy::FIFO ? "/fifo" : "/lru");
+        fs::create_directories(config.storage_filepath);
+        auto bucket_config = BoundedConfig();
+        bucket_config.eviction_policy = policy;
+        // Coalesce iovecs: the legacy buffered writer cannot exceed IOV_MAX.
+        bucket_config.direct_io_write = true;
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init());
+        std::vector<std::string> oversized;
+        for (int i = 0; i < 1025; ++i)
+            oversized.push_back("large_" + std::to_string(i));
+        ASSERT_TRUE(BoundedPut(backend, oversized));
+        ASSERT_TRUE(BoundedPut(backend, {"eligible"}));
+        std::vector<std::string> notified;
+        auto result = backend.EvictAboveDiskWatermark(
+            0, 0, [&](const auto& keys) -> tl::expected<void, ErrorCode> {
+                notified.insert(notified.end(), keys.begin(), keys.end());
+                return {};
+            });
+        ASSERT_TRUE(result);
+        EXPECT_EQ(notified, std::vector<std::string>{"eligible"});
+        BoundedExists(backend, oversized.front(), true);
+        BoundedExists(backend, "eligible", false);
+        auto again = backend.EvictAboveDiskWatermark(
+            0, 0, [&](const auto&) -> tl::expected<void, ErrorCode> {
+                ADD_FAILURE()
+                    << "Oversized-only storage must not invoke callback";
+                return {};
+            });
+        ASSERT_TRUE(again);
+        EXPECT_TRUE(again->empty());
+    }
+}
+
+TEST_F(StorageBackendTest, BoundedKeyByteBudgetAcceptsBoundaryAndSkipsLarger) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, BoundedConfig());
+    ASSERT_TRUE(backend.Init());
+    const std::string over(1024 * 1024 + 1, 'x');
+    const std::string exact(1024 * 1024, 'y');
+    ASSERT_TRUE(BoundedPut(backend, {over}));
+    ASSERT_TRUE(BoundedPut(backend, {exact}));
+    size_t calls = 0;
+    auto result = backend.EvictAboveDiskWatermark(
+        0, 0, [&](const auto& keys) -> tl::expected<void, ErrorCode> {
+            ++calls;
+            EXPECT_EQ(keys.size(), 1U);
+            if (!keys.empty()) {
+                EXPECT_EQ(keys.front().size(), exact.size());
+                EXPECT_EQ(keys.front().front(), 'y');
+            }
+            return {};
+        });
+    ASSERT_TRUE(result);
+    EXPECT_EQ(calls, 1U);
+    BoundedExists(backend, over, true);
+    BoundedExists(backend, exact, false);
+}
+
+TEST_F(StorageBackendTest,
+       BoundedFailedWriteReleasesReservationAfterPartialSuccess) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    auto bucket_config = BoundedConfig();
+    bucket_config.max_total_size = 24 * 1024;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    ASSERT_TRUE(BoundedPut(backend, {"old_a"}, 6 * 1024));
+    ASSERT_TRUE(BoundedPut(backend, {"old_b"}, 6 * 1024));
+    int calls = 0;
+    auto failed =
+        BoundedPut(backend, {"incoming"}, 20 * 1024,
+                   [&](const auto&) -> tl::expected<void, ErrorCode> {
+                       if (++calls == 2)
+                           return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+                       return {};
+                   });
+    ASSERT_FALSE(failed);
+    EXPECT_EQ(calls, 2);
+    EXPECT_EQ(failed.error(), ErrorCode::RPC_TIMEOUT);
+    BoundedExists(backend, "old_a", false);
+    BoundedExists(backend, "old_b", true);
+    BoundedExists(backend, "incoming", false);
+    // Same incoming key and capacity can be reserved again after rollback.
+    EXPECT_TRUE(BoundedPut(backend, {"incoming"}, 20 * 1024));
+}
+}  // namespace mooncake::test
