@@ -244,6 +244,20 @@ class WrappedMasterService {
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id);
 
+    tl::expected<std::vector<PromotionTaskItemV2>, ErrorCode>
+    PromotionObjectHeartbeatV2(const UUID& client_id);
+    tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStartV2(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, uint64_t size,
+        const std::vector<std::string>& preferred_segments,
+        const UUID& task_id);
+    tl::expected<void, ErrorCode> NotifyPromotionSuccessV2(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const UUID& task_id);
+    tl::expected<void, ErrorCode> NotifyPromotionFailureV2(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const UUID& task_id);
+
     tl::expected<UUID, ErrorCode> CreateDrainJob(
         const CreateDrainJobRequest& request);
 

@@ -120,6 +120,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 FileStorage::~FileStorage() {
     LOG(INFO) << "Shutdown FileStorage...";
     heartbeat_running_ = false;
+    StopPromotionWorker();
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
     }
@@ -213,6 +214,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         }
     }
 
+    StartPromotionWorker();
     heartbeat_running_.store(true);
     heartbeat_thread_ = std::thread([this]() {
         LOG(INFO) << "Starting periodic task with interval: "
@@ -779,11 +781,6 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     VLOG(1) << "Completed heartbeat with offloaded objects count: "
             << offloading_objects.size();
 
-    // Drive any pending L2->L1 promotion work for this client. Failures
-    // inside ProcessPromotionTasks are logged per-key and do not propagate;
-    // promotion is best-effort and must never break offload.
-    (void)ProcessPromotionTasks();
-
     // Proactive disk watermarks keep LOCAL_DISK usage below the configured
     // low watermark even when no new write arrives to trigger reactive
     // eviction.
@@ -849,14 +846,51 @@ tl::expected<void, ErrorCode> FileStorage::DrainLocalDiskSegment(
     return {};
 }
 
-tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
+void FileStorage::StartPromotionWorker() {
+    std::lock_guard lock(promotion_worker_mutex_);
+    promotion_worker_stopping_ = false;
+    promotion_stop_requested_.store(false);
+    promotion_thread_ = std::thread([this] {
+        std::unique_lock lock(promotion_worker_mutex_);
+        while (!promotion_worker_stopping_) {
+            lock.unlock();
+            bool progressed = false;
+            if (!draining_.load()) {
+                (void)ProcessPromotionTasks(&progressed);
+            }
+            lock.lock();
+            // Drain useful backlog serially; empty/error-only batches back off
+            // to prevent hot retry loops under DRAM pressure or broken I/O.
+            if (progressed) continue;
+            promotion_worker_cv_.wait_for(
+                lock, std::chrono::seconds(config_.heartbeat_interval_seconds),
+                [this] { return promotion_worker_stopping_; });
+        }
+    });
+}
+
+void FileStorage::StopPromotionWorker() {
+    promotion_stop_requested_.store(true);
+    {
+        std::lock_guard lock(promotion_worker_mutex_);
+        promotion_worker_stopping_ = true;
+    }
+    promotion_worker_cv_.notify_all();
+    // Preserve the staging arena and client until synchronous I/O completes.
+    // A timeout followed by detach would allow writes through freed buffers.
+    if (promotion_thread_.joinable()) promotion_thread_.join();
+}
+
+tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks(
+    bool* progressed) {
+    if (progressed) *progressed = false;
     if (client_ == nullptr) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::vector<PromotionTaskItem> promotion_objects;
+    std::vector<PromotionTaskItemV2> promotion_objects;
     auto heartbeat_result =
-        client_->PromotionObjectHeartbeat(promotion_objects);
+        client_->PromotionObjectHeartbeatV2(promotion_objects);
     if (!heartbeat_result) {
         // SEGMENT_NOT_FOUND happens between MountLocalDiskSegment and the
         // first heartbeat tick if the master forgets us (e.g. across a master
@@ -879,12 +913,10 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
     // DRAM segment.
     const std::vector<std::string> preferred_segments;
 
-    // The master caps per-heartbeat work via PromotionObjectHeartbeat,
-    // returning at most one task per call so the heartbeat thread stays
-    // within the client-liveness window even for large objects. Leftover
-    // work stays queued in the master's promotion_objects map and is
-    // returned on subsequent heartbeats; we process whatever we received
-    // here without a second client-side cap.
+    // One serial worker, with no client-side queue and staging taken from the
+    // existing fixed arena. The master bounds each batch; slow SSD/RDMA work
+    // cannot delay FileStorage's offload/remount/watermark heartbeat. Client
+    // liveness Ping is already maintained by a separate Client thread.
     for (const auto& task : promotion_objects) {
         const auto& key = task.key;
         const auto& tenant_id = task.tenant_id;
@@ -893,41 +925,24 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         if (size <= 0) {
             LOG(WARNING) << "Skipping promotion for key=" << key
                          << " with non-positive size=" << size;
+            (void)client_->NotifyPromotionFailureV2(key, tenant_id,
+                                                    task.task_id);
+            continue;
+        }
+        if (draining_.load() || promotion_stop_requested_.load()) {
+            (void)client_->NotifyPromotionFailureV2(key, tenant_id,
+                                                    task.task_id);
             continue;
         }
 
-        auto alloc_result = client_->PromotionAllocStart(
-            key, tenant_id, static_cast<uint64_t>(size), preferred_segments);
-        if (!alloc_result) {
-            // AllocStart failed (typically NO_AVAILABLE_HANDLE under
-            // DRAM pressure). No staged buffer to release, but the
-            // task entry already claimed a promotion_in_flight_ slot
-            // at admission. Notify the master to release it
-            // immediately; otherwise the slot stays pinned for the
-            // reaper TTL (~10 min default), turning transient DRAM
-            // pressure into a sustained outage of promotion_queue_limit_.
-            // Notify is idempotent and handles alloc_id == 0 correctly.
-            VLOG(1) << "PromotionAllocStart failed for key=" << key
-                    << ", error=" << alloc_result.error()
-                    << " (likely no free DRAM); releasing master slot";
-            auto release = client_->NotifyPromotionFailure(key, tenant_id);
-            if (!release) {
-                VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
-                        << key << ", error=" << release.error()
-                        << "; master reaper will reclaim on TTL expiry";
-            }
-            continue;
-        }
-
-        // Every failure path past this point has a master-side staged
-        // PROCESSING MEMORY buffer and an incremented in-flight slot.
-        // Eagerly notify the master on failure so the buffer is
-        // reclaimed and the slot is freed; otherwise transient SSD
-        // throttling or RDMA flakes saturate promotion_queue_limit_
-        // for the full reaper TTL. NotifyPromotionFailure is
-        // idempotent and best-effort — the reaper is the long-stop.
-        auto release_master_state = [this, &key, &tenant_id]() {
-            auto release = client_->NotifyPromotionFailure(key, tenant_id);
+        // Every admitted task holds a source pin and an in-flight slot.
+        // Stage/read SSD before AllocStart so disk latency consumes no target
+        // transfer lease. Fenced failure cannot cancel a replacement task.
+        // Release failures eagerly; the reaper remains the backstop if the
+        // notification cannot reach the master.
+        auto release_master_state = [this, &key, &tenant_id, &task]() {
+            auto release =
+                client_->NotifyPromotionFailureV2(key, tenant_id, task.task_id);
             if (!release) {
                 VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
                         << key << ", error=" << release.error()
@@ -958,6 +973,20 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
             continue;
         }
 
+        if (draining_.load() || promotion_stop_requested_.load()) {
+            release_master_state();
+            continue;
+        }
+        auto alloc_result = client_->PromotionAllocStartV2(
+            key, tenant_id, static_cast<uint64_t>(size), preferred_segments,
+            task.task_id);
+        if (!alloc_result) {
+            VLOG(1) << "PromotionAllocStart failed for key=" << key
+                    << ", error=" << alloc_result.error();
+            release_master_state();
+            continue;
+        }
+
         // (b) TE-write from the staging slice into the freshly-allocated
         // MEMORY replica. Slice ptr may have been bumped by O_DIRECT offset
         // correction in BatchLoad, so re-read it from the slice map.
@@ -979,7 +1008,8 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
 
         // (c) Commit. Master flips the PROCESSING replica to COMPLETE and it
         // becomes visible to readers.
-        auto notify_res = client_->NotifyPromotionSuccess(key, tenant_id);
+        auto notify_res =
+            client_->NotifyPromotionSuccessV2(key, tenant_id, task.task_id);
         if (!notify_res) {
             // The write landed but the commit failed. We can't retry the
             // commit (the success path is one-shot via alloc_id), and we
@@ -993,6 +1023,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
             continue;
         }
 
+        if (progressed) *progressed = true;
         VLOG(1) << "Promotion completed for key=" << key << ", size=" << size;
     }
 

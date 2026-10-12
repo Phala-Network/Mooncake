@@ -489,11 +489,11 @@ class Client {
      * @param offloading_objects On return, contains the tenant-scoped object
      * tasks that require offload.
      */
-    tl::expected<void, ErrorCode> OffloadObjectHeartbeat(
+    virtual tl::expected<void, ErrorCode> OffloadObjectHeartbeat(
         bool enable_offloading,
         std::vector<OffloadTaskItem>& offloading_objects);
 
-    tl::expected<bool, ErrorCode> PollRemoveAll();
+    virtual tl::expected<bool, ErrorCode> PollRemoveAll();
 
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         int64_t ssd_total_capacity_bytes);
@@ -505,6 +505,20 @@ class Client {
      * replicas via PromotionAllocStart + NotifyPromotionSuccess.
      */
     // Virtual to enable subclassing in unit tests.
+    virtual tl::expected<void, ErrorCode> PromotionObjectHeartbeatV2(
+        std::vector<PromotionTaskItemV2>& tasks);
+    virtual tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionAllocStartV2(const std::string& key, const std::string& tenant_id,
+                          uint64_t size,
+                          const std::vector<std::string>& preferred_segments,
+                          const UUID& task_id);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionSuccessV2(
+        const std::string& key, const std::string& tenant_id,
+        const UUID& task_id);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionFailureV2(
+        const std::string& key, const std::string& tenant_id,
+        const UUID& task_id);
+
     virtual tl::expected<void, ErrorCode> PromotionObjectHeartbeat(
         std::vector<PromotionTaskItem>& promotion_objects);
 

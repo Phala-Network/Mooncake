@@ -66,57 +66,65 @@ TEST(LocalSsdTaskMailboxTest, PromotionsAreBatchedAndRemoveAllIsConsumed) {
     EXPECT_FALSE(mailbox.ConsumeRemoveAll());
 }
 
-TEST(LocalSsdTaskMailboxTest, PromotionsAreDeliveredByRecency) {
+TEST(LocalSsdTaskMailboxTest,
+     PromotionsRemainFifoUnderContinuousHotAdmissions) {
     LocalSsdTaskMailbox mailbox(false);
-    ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", "a", 1)) ==
-                ErrorCode::OK);
-    ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", "b", 2)) ==
-                ErrorCode::OK);
-    ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", "c", 3)) ==
-                ErrorCode::OK);
-
-    // Without any touch, the most recent enqueue is delivered first.
-    auto first = mailbox.TakePromotions(1);
-    ASSERT_EQ(first.size(), 1);
-    EXPECT_EQ(first.front(), Promotion("t", "c", 3));
-
-    // A touch re-marks an older entry ahead of newer ones.
-    ASSERT_TRUE(mailbox.TouchPromotion(TenantId("t"), "a"));
-    auto second = mailbox.TakePromotions(1);
-    ASSERT_EQ(second.size(), 1);
-    EXPECT_EQ(second.front(), Promotion("t", "a", 1));
-
-    // A duplicate enqueue keeps the dedup contract but refreshes recency.
-    ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", "b", 2)) ==
-                ErrorCode::OBJECT_ALREADY_EXISTS);
-    auto third = mailbox.TakePromotions(1);
-    ASSERT_EQ(third.size(), 1);
-    EXPECT_EQ(third.front(), Promotion("t", "b", 2));
-
+    for (const char* key : {"a", "b", "c"}) {
+        ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", key, 1)) ==
+                    ErrorCode::OK);
+    }
+    for (const char* oldest : {"a", "b", "c"}) {
+        // New arrivals, duplicate admission, and touches cannot starve old
+        // work.
+        ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", "hot", 1)) ==
+                    ErrorCode::OK);
+        ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", "hot", 2)) ==
+                    ErrorCode::OBJECT_ALREADY_EXISTS);
+        ASSERT_TRUE(mailbox.TouchPromotion(TenantId("t"), "hot"));
+        auto batch = mailbox.TakePromotions(1);
+        ASSERT_EQ(batch.size(), 1);
+        EXPECT_EQ(batch.front(), Promotion("t", oldest, 1));
+        ASSERT_TRUE(mailbox.RemovePromotion(TenantId("t"), "hot"));
+    }
     EXPECT_TRUE(mailbox.TakePromotions(10).empty());
     EXPECT_FALSE(mailbox.TouchPromotion(TenantId("t"), "missing"));
 }
 
-TEST(LocalSsdTaskMailboxTest, TakePromotionsKeepsGlobalRecencyAcrossTicks) {
+TEST(LocalSsdTaskMailboxTest, CancellationAndReadmissionPreserveBoundedFifo) {
     LocalSsdTaskMailbox mailbox(false);
-    for (const char* key : {"k1", "k2", "k3", "k4", "k5"}) {
+    for (const char* key : {"a", "b", "c"}) {
         ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", key, 1)) ==
                     ErrorCode::OK);
     }
-    ASSERT_TRUE(mailbox.TouchPromotion(TenantId("t"), "k2"));
-
-    // k2 (touched) first, then the newest enqueue. The batch limit must not
-    // degrade the remainder to hash order on the next tick.
+    EXPECT_TRUE(mailbox.TakePromotions(0).empty());
+    ASSERT_TRUE(mailbox.RemovePromotion(TenantId("t"), "b"));
+    EXPECT_FALSE(mailbox.RemovePromotion(TenantId("t"), "b"));
+    ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", "b", 2)) ==
+                ErrorCode::OK);
     auto batch = mailbox.TakePromotions(2);
     ASSERT_EQ(batch.size(), 2);
-    EXPECT_EQ(batch[0], Promotion("t", "k2", 1));
-    EXPECT_EQ(batch[1], Promotion("t", "k5", 1));
-
+    EXPECT_EQ(batch[0], Promotion("t", "a", 1));
+    EXPECT_EQ(batch[1], Promotion("t", "c", 1));
     auto rest = mailbox.TakePromotions(10);
-    ASSERT_EQ(rest.size(), 3);
-    EXPECT_EQ(rest[0], Promotion("t", "k4", 1));
-    EXPECT_EQ(rest[1], Promotion("t", "k3", 1));
-    EXPECT_EQ(rest[2], Promotion("t", "k1", 1));
+    ASSERT_EQ(rest.size(), 1);
+    EXPECT_EQ(rest.front(), Promotion("t", "b", 2));
+}
+
+TEST(LocalSsdTaskMailboxTest, DequeuedGenerationCannotChangeOnReadmission) {
+    LocalSsdTaskMailbox mailbox(false);
+    const UUID old_id{1, 2}, new_id{3, 4};
+    ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", "key", 1), old_id) ==
+                ErrorCode::OK);
+    auto old = mailbox.TakePromotionsV2(1);
+    ASSERT_EQ(old.size(), 1);
+    ASSERT_TRUE(mailbox.EnqueuePromotion(Promotion("t", "key", 2), new_id) ==
+                ErrorCode::OK);
+    EXPECT_EQ(old.front().task_id, old_id);
+    auto fresh = mailbox.TakePromotionsV2(1);
+    ASSERT_EQ(fresh.size(), 1);
+    EXPECT_EQ(fresh.front().task_id, new_id);
+    EXPECT_EQ(fresh.front().size, 2);
+    EXPECT_TRUE(mailbox.TakePromotionsV2(1).empty());
 }
 
 TEST(LocalSsdManagerTest, TouchPromotionIsClientScoped) {

@@ -7539,18 +7539,21 @@ bool MasterService::CancelQueuedOffloadTask(TenantState& tenant_state,
 // via the LOCAL_DISK replica's embedded client_id rather than via the
 // segment-name reverse lookup.
 tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
-    const ObjectIdentity& object_id, Replica& source_replica) {
+    const ObjectIdentity& object_id, Replica& source_replica,
+    const UUID& task_id) {
     auto holder_id = source_replica.get_local_disk_client_id();
     if (!holder_id.has_value()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto err = local_ssd_manager_.EnqueuePromotion(
-        *holder_id, PromotionTaskItem{.tenant_id = object_id.tenant_id.value(),
-                                      .key = object_id.user_key,
-                                      .size = static_cast<int64_t>(
-                                          source_replica.get_descriptor()
-                                              .get_local_disk_descriptor()
-                                              .object_size)});
+        *holder_id,
+        PromotionTaskItem{
+            .tenant_id = object_id.tenant_id.value(),
+            .key = object_id.user_key,
+            .size = static_cast<int64_t>(source_replica.get_descriptor()
+                                             .get_local_disk_descriptor()
+                                             .object_size)},
+        task_id);
     if (err == ErrorCode::SEGMENT_NOT_FOUND) {
         // Holder client expired or never registered LocalSSD;
         // the LOCAL_DISK replica will be cleaned up by ClientMonitorFunc on
@@ -8580,7 +8583,8 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
         source->get_descriptor().get_local_disk_descriptor().object_size;
 
     // Try to enqueue on the holder client. On failure, drop the refcnt back.
-    auto push_result = PushPromotionQueue(object_id, *source);
+    const UUID task_id = generate_uuid();
+    auto push_result = PushPromotionQueue(object_id, *source, task_id);
     if (!push_result) {
         source->dec_refcnt();
         VLOG(1) << "promotion_push_failed key=" << key
@@ -8623,6 +8627,7 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
                            .alloc_id = 0,
                            .object_size = object_size,
                            .start_time = std::chrono::system_clock::now(),
+                           .task_id = task_id,
                            .holder_id = holder_id,
                            .execution_failures = execution_failures});
     promotion_in_flight_.fetch_add(1, std::memory_order_relaxed);
@@ -8635,20 +8640,41 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
 auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
     -> tl::expected<std::vector<PromotionTaskItem>, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    // Return at most promotion_max_per_heartbeat_ tasks. Each task does
-    // a synchronous SSD read + RDMA write on the client side; allowing
-    // more than one per heartbeat risks blocking past the client-
-    // liveness window and the master marking the client dead. The rest
-    // stay queued in the mailbox for subsequent heartbeats. The
-    // cap must live here (server side) rather than on the client so
-    // leftover work isn't silently dropped.
+    // Bound each response; remaining work stays in the server mailbox.
     return local_ssd_manager_.TakePromotions(client_id,
                                              promotion_max_per_heartbeat_);
 }
 
+auto MasterService::PromotionObjectHeartbeatV2(const UUID& client_id)
+    -> tl::expected<std::vector<PromotionTaskItemV2>, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    auto pending = local_ssd_manager_.TakePromotionsV2(
+        client_id, promotion_max_per_heartbeat_);
+    if (!pending) return tl::make_unexpected(pending.error());
+    std::vector<PromotionTaskItemV2> tasks;
+    tasks.reserve(pending->size());
+    for (const auto& item : *pending) {
+        const auto object_id =
+            MakeObjectIdentityForRequest(item.key, TenantId(item.tenant_id));
+        MetadataAccessorRW accessor(this, object_id);
+        if (!accessor.Exists()) continue;
+        auto& state = accessor.GetTenantState();
+        auto task = state.promotion_tasks.find(item.key);
+        if (task == state.promotion_tasks.end() ||
+            task->second.holder_id != client_id ||
+            task->second.task_id != item.task_id)
+            continue;
+        tasks.push_back({item.tenant_id, item.key,
+                         static_cast<int64_t>(task->second.object_size),
+                         task->second.task_id});
+    }
+    return tasks;
+}
+
 auto MasterService::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
-    uint64_t size, const std::vector<std::string>& preferred_segments)
+    uint64_t size, const std::vector<std::string>& preferred_segments,
+    std::optional<UUID> task_id)
     -> tl::expected<PromotionAllocStartResponse, ErrorCode> {
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -8676,6 +8702,10 @@ auto MasterService::PromotionAllocStart(
     auto& tenant_state = accessor.GetTenantState();
     auto task_it = tenant_state.promotion_tasks.find(object_id.user_key);
     if (task_it == tenant_state.promotion_tasks.end()) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    if (task_id && task_it->second.task_id != *task_id) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
@@ -8767,7 +8797,8 @@ auto MasterService::PromotionAllocStart(
 
 auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
                                            const std::string& key,
-                                           const TenantId& tenant_id)
+                                           const TenantId& tenant_id,
+                                           std::optional<UUID> task_id)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -8786,6 +8817,10 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     auto task_it = tenant_state.promotion_tasks.find(object_id.user_key);
     if (task_it == tenant_state.promotion_tasks.end() ||
         task_it->second.alloc_id == 0) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    if (task_id && task_it->second.task_id != *task_id) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
@@ -8888,7 +8923,8 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
 
 auto MasterService::NotifyPromotionFailure(const UUID& client_id,
                                            const std::string& key,
-                                           const TenantId& tenant_id)
+                                           const TenantId& tenant_id,
+                                           std::optional<UUID> task_id)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -8906,6 +8942,10 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
         // idempotent — repeated failure notifications on the same key
         // should be safe.
         return {};
+    }
+
+    if (task_id && task_it->second.task_id != *task_id) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
     // Holder-only gate (see PromotionTask::holder_id doc).
@@ -9059,6 +9099,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
     MetadataShardAccessorRW& shard,
     const std::chrono::system_clock::time_point& now) {
     std::list<DiscardedReplicas> discarded_replicas;
+    uint64_t expired_promotions = 0;
 
     for (auto tenant_it = shard->tenants.begin();
          tenant_it != shard->tenants.end();) {
@@ -9352,8 +9393,10 @@ void MasterService::DiscardExpiredProcessingReplicas(
             ReleaseTenantQuota(
                 GetBoundTenantQuotaHandle(tenant_state),
                 std::exchange(task_it->second.pending_quota_charge_bytes, 0));
-            LOG(WARNING) << "Promotion task expired for key: "
-                         << task_it->first;
+            // Remove queued work under the shard lock before re-admission.
+            local_ssd_manager_.RemovePromotion(
+                task_it->second.holder_id, tenant_it->first, task_it->first);
+            ++expired_promotions;
             task_it = tenant_state.promotion_tasks.erase(task_it);
             promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
             MasterMetricManager::instance().dec_promotion_in_flight();
@@ -9364,6 +9407,25 @@ void MasterService::DiscardExpiredProcessingReplicas(
             tenant_it = shard->tenants.erase(tenant_it);
         } else {
             ++tenant_it;
+        }
+    }
+
+    if (expired_promotions > 0) {
+        const int64_t now_sec =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                now.time_since_epoch())
+                .count();
+        auto last =
+            promotion_expiry_last_log_sec_.load(std::memory_order_relaxed);
+        if (now_sec - last >= 60 &&
+            promotion_expiry_last_log_sec_.compare_exchange_strong(
+                last, now_sec, std::memory_order_relaxed)) {
+            // Keep every expiry in metrics; bound warning volume and avoid
+            // keys.
+            LOG(WARNING)
+                << "Promotion task expiry summary: expired_total="
+                << MasterMetricManager::instance().get_promotion_expired()
+                << ", current_shard_batch=" << expired_promotions;
         }
     }
 
