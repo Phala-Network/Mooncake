@@ -11,6 +11,7 @@ This repair starts from the deployed public source `489ad87003035ced0a0f2038a1fa
 - SSD staging/read precedes remote allocation. Failed reads therefore do not consume the target transfer lease. Failure notifications use the captured UUID and cannot cancel a replacement admission.
 - Cancellation and expiry remove untaken mailbox entries under the shard lock, preserves all cumulative metrics, and emits at most one key-free summary warning per master per minute.
 - Shutdown stops intake, interrupts idle backoff, and joins current synchronous work before destroying buffers. It never detaches I/O. This API cannot forcibly cancel a hung kernel disk read. Existing transfer leases still govern active remote writes; generation fencing protects control-plane callbacks, not an arbitrarily paused writer's physical address.
+- Explicit client close rejects new offload RPCs and drains admitted asynchronous I/O before stopping its server. It then calls idempotent FileStorage shutdown, joins heartbeat/promotion/GC and metadata rescan, releases the retained Client reference, and unregisters the Client before freeing segment memory. A retained FileStorage no longer postpones worker shutdown past pool release. This fixes a demonstrated ownership-order hazard, without attributing the observed old-store shutdown SIGSEGV to it or promising arbitrary concurrent SDK close safety.
 
 ## Adjacent SSD backports
 

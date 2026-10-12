@@ -19,6 +19,11 @@ class FileStorage {
                 SsdMetric* ssd_metric = nullptr);
     ~FileStorage();
 
+    // Join internal work and release the Client reference before its owner
+    // unregisters/frees segment memory. Safe even while another owner retains
+    // this FileStorage; callers must first drain external offload RPCs.
+    void Shutdown();
+
     tl::expected<void, ErrorCode> Init();
 
     void RemoveAll();
@@ -193,6 +198,8 @@ class FileStorage {
     tl::expected<void, ErrorCode> ReRegisterOffloadedObjects();
 
     std::shared_ptr<Client> client_;
+    std::mutex shutdown_mutex_;
+    bool shutdown_complete_{false};
     SsdMetric* ssd_metric_{nullptr};
     std::string local_rpc_addr_;
     // Pinned memory for GPU staging and SSD-to-GPU restores.

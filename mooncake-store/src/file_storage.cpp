@@ -117,8 +117,13 @@ FileStorage::FileStorage(const FileStorageConfig& config,
 #endif
 }
 
-FileStorage::~FileStorage() {
+FileStorage::~FileStorage() { Shutdown(); }
+
+void FileStorage::Shutdown() {
+    std::lock_guard shutdown_lock(shutdown_mutex_);
+    if (shutdown_complete_) return;
     LOG(INFO) << "Shutdown FileStorage...";
+    draining_.store(true);
     heartbeat_running_ = false;
     StopPromotionWorker();
     if (heartbeat_thread_.joinable()) {
@@ -128,6 +133,12 @@ FileStorage::~FileStorage() {
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
     }
+    // The heartbeat may have launched this job before observing draining_.
+    if (rescan_future_.valid()) rescan_future_.wait();
+    // A retained FileStorage must not postpone Client teardown/unregistration
+    // until after RealClient has released the underlying segment allocations.
+    client_.reset();
+    shutdown_complete_ = true;
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {
