@@ -10,6 +10,8 @@
 #include "client_service.h"
 #include "file_storage.h"
 #include "storage_backend.h"
+#include "real_client.h"
+#include <async_simple/coro/SyncAwait.h>
 
 namespace mooncake {
 namespace fs_test {
@@ -170,6 +172,12 @@ class FileStoragePromotionTest : public ::testing::Test {
     void Stop() { storage->StopPromotionWorker(); }
     auto Heartbeat() { return storage->Heartbeat(); }
     void Drain() { storage->draining_.store(true); }
+    bool HasClient(const FileStorage& value) {
+        return value.client_ != nullptr;
+    }
+    void SetRescan(std::future<void> future) {
+        storage->rescan_future_ = std::move(future);
+    }
 };
 
 TEST_F(FileStoragePromotionTest, EmptyAndRpcErrorsBackOffWithoutAllocation) {
@@ -290,6 +298,96 @@ TEST_F(FileStoragePromotionTest, AllocationPressureDoesNotHotLoop) {
     Stop();
     EXPECT_EQ(client->polls, 1);
     EXPECT_EQ(client->failures, 1);
+}
+
+TEST_F(FileStoragePromotionTest,
+       ExplicitCloseJoinsRetainedStorageBeforePoolFree) {
+    Queue();
+    backend->blocked = true;
+    Start();
+    ASSERT_TRUE(backend->WaitEntered());
+    RealClient owner;
+    owner.client_ = client;
+    auto retained = std::shared_ptr<FileStorage>(storage.release());
+    owner.file_storage_ = retained;
+    owner.segment_ptrs_.emplace_back(std::malloc(4096));
+    auto close =
+        std::async(std::launch::async, [&] { return owner.tearDownAll(); });
+    const auto state = close.wait_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(state, std::future_status::timeout);
+    if (state == std::future_status::timeout)
+        EXPECT_EQ(owner.segment_ptrs_.size(), 1);
+    backend->Release();
+    EXPECT_EQ(close.get(), 0);
+    EXPECT_TRUE(owner.segment_ptrs_.empty());
+    EXPECT_FALSE(HasClient(*retained));
+    EXPECT_EQ(client->allocations, 0);
+    EXPECT_EQ(client->failures, 1);
+    retained->Shutdown();
+    EXPECT_EQ(owner.tearDownAll(), 0);
+}
+
+TEST_F(FileStoragePromotionTest,
+       CloseDrainsAdmittedAsyncOffloadAndRejectsNewRpc) {
+    backend->blocked = true;
+    RealClient owner;
+    owner.client_ = client;
+    auto retained = std::shared_ptr<FileStorage>(storage.release());
+    owner.file_storage_ = retained;
+    owner.segment_ptrs_.emplace_back(std::malloc(4096));
+    auto request = std::async(std::launch::async, [&] {
+        return async_simple::coro::syncAwait(
+            owner.batch_get_offload_object({"key"}, {1024}));
+    });
+    const bool entered = backend->WaitEntered();
+    if (!entered) backend->Release();
+    EXPECT_TRUE(entered);
+    auto close =
+        std::async(std::launch::async, [&] { return owner.tearDownAll(); });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!owner.closed_.load() &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    const bool admission_closed = owner.closed_.load();
+    if (!admission_closed) backend->Release();
+    EXPECT_TRUE(admission_closed);
+    const auto state = close.wait_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(state, std::future_status::timeout);
+    if (entered && admission_closed && state == std::future_status::timeout) {
+        EXPECT_EQ(owner.segment_ptrs_.size(), 1);
+        EXPECT_FALSE(owner.release_offload_buffer(0));
+        EXPECT_FALSE(async_simple::coro::syncAwait(
+            owner.batch_get_offload_object({"rejected"}, {1024})));
+    }
+    backend->Release();
+    EXPECT_TRUE(request.get());
+    EXPECT_EQ(close.get(), 0);
+    EXPECT_TRUE(owner.segment_ptrs_.empty());
+    EXPECT_FALSE(HasClient(*retained));
+    EXPECT_EQ(owner.active_offload_rpcs_, 0);
+}
+
+TEST_F(FileStoragePromotionTest, ShutdownWaitsForMetadataRescan) {
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto released = release.get_future();
+    SetRescan(std::async(std::launch::async, [&] {
+        entered.set_value();
+        released.wait();
+    }));
+    entered.get_future().wait();
+    auto shutdown =
+        std::async(std::launch::async, [&] { storage->Shutdown(); });
+    EXPECT_EQ(shutdown.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+    release.set_value();
+    shutdown.get();
+    EXPECT_FALSE(HasClient(*storage));
+    EXPECT_FALSE(Heartbeat());
+    EXPECT_EQ(client->offload_polls, 0);
+    storage->Shutdown();
 }
 }  // namespace mooncake
 

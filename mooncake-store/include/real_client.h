@@ -942,6 +942,12 @@ class RealClient : public PyClient {
     std::string local_hostname;
     std::string local_rpc_addr;
     std::unique_ptr<coro_rpc::coro_rpc_server> offload_rpc_server_;
+    using OffloadRpcGuard = std::unique_ptr<RealClient, void (*)(RealClient *)>;
+    OffloadRpcGuard AcquireOffloadRpc();
+    static void ReleaseOffloadRpc(RealClient *client);
+    std::mutex offload_rpc_mutex_;
+    std::condition_variable offload_rpc_cv_;
+    size_t active_offload_rpcs_{0};
     int offload_rpc_port_ = 0;
     bool use_hugepage_ = false;
 

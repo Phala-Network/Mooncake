@@ -9,3 +9,5 @@ Tests cover starvation under hot arrivals, queue generation capture, cancelled/e
 One worker avoids unbounded concurrency or additional local queues. FIFO replaces recency sorting rather than adding scheduler complexity. Separate V2 RPCs preserve legacy serialization. Existing SSD reader-window and bounded rollback changes on main remain prerequisites for concurrent watermark eviction.
 
 Generation fencing protects control-plane callbacks, not an arbitrarily paused physical writer. Synchronous disk I/O cannot be forcibly cancelled; LOCAL_MEMCPY waits are not bounded by the Transfer Engine timeout. These changes do not establish the cause of historical Ping timeouts or NUMA OOMs.
+
+Explicit close drains admitted offload RPCs before stopping the server, joins FileStorage workers and metadata rescan, and releases retained Client ownership before segment teardown. This fixes the close-time pool lifetime hazard; it does not attribute the old-store SIGSEGV or promise arbitrary concurrent SDK close safety.
