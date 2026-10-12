@@ -722,10 +722,6 @@ RealClient::RealClient() {
 }
 
 RealClient::~RealClient() {
-    if (offload_rpc_server_) {
-        offload_rpc_server_->stop();
-        offload_rpc_server_.reset();
-    }
     // Ensure resources are cleaned even if not explicitly closed
     stop_http_server();
     tearDownAll_internal();
@@ -1347,16 +1343,28 @@ int RealClient::initAll(const std::string &protocol_,
 }
 
 tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
-    // Ensure cleanup executes once across destructor/close/signal paths
-    bool expected = false;
-    if (!closed_.compare_exchange_strong(expected, true,
-                                         std::memory_order_acq_rel)) {
-        return {};
+    // Close admission and observe the active count under the same gate.
+    // Keep the executor alive until SSD I/O continuations have completed.
+    {
+        std::unique_lock lock(offload_rpc_mutex_);
+        bool expected = false;
+        if (!closed_.compare_exchange_strong(expected, true,
+                                             std::memory_order_acq_rel)) {
+            return {};
+        }
+        offload_rpc_cv_.wait(lock,
+                             [this] { return active_offload_rpcs_ == 0; });
     }
 
     stop_ipc_server();
     stop_dummy_client_monitor();
     stop_http_server();
+
+    if (offload_rpc_server_) {
+        offload_rpc_server_->stop();
+        offload_rpc_server_.reset();
+    }
+    if (file_storage_) file_storage_->Shutdown();
 
     if (!client_) {
         // Not initialized or already cleaned; treat as success for idempotence
@@ -1377,6 +1385,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
 
     // Reset all resources
     client_.reset();
+    file_storage_.reset();
     ReleaseAllMountedSegmentRecords();
     ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();
@@ -6756,6 +6765,8 @@ tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
 async_simple::coro::Lazy<tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
 RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
                                      const std::vector<int64_t> &sizes) {
+    auto guard = AcquireOffloadRpc();
+    if (!guard) co_return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     // Run SSD I/O on a dedicated thread pool so the coro_rpc IO thread is
     // free to handle ping and other RPCs. Same heap-owned state pattern as
     // batch_get_into_dummy_helper: the lambda captures only a raw pointer.
@@ -6784,12 +6795,29 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
 }
 
 bool RealClient::release_offload_buffer(uint64_t batch_id) {
+    auto guard = AcquireOffloadRpc();
+    if (!guard) return false;
     if (!file_storage_) {
         LOG(WARNING)
             << "release_offload_buffer called but file_storage_ is null";
         return false;
     }
     return file_storage_->ReleaseBuffer(batch_id);
+}
+
+RealClient::OffloadRpcGuard RealClient::AcquireOffloadRpc() {
+    std::lock_guard lock(offload_rpc_mutex_);
+    if (closed_.load(std::memory_order_acquire)) {
+        return OffloadRpcGuard(nullptr, &RealClient::ReleaseOffloadRpc);
+    }
+    ++active_offload_rpcs_;
+    return OffloadRpcGuard(this, &RealClient::ReleaseOffloadRpc);
+}
+
+void RealClient::ReleaseOffloadRpc(RealClient *client) {
+    std::lock_guard lock(client->offload_rpc_mutex_);
+    --client->active_offload_rpcs_;
+    if (client->active_offload_rpcs_ == 0) client->offload_rpc_cv_.notify_all();
 }
 
 bool RealClient::can_use_pinned_restore_arena(

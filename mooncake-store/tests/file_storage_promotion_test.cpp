@@ -1,399 +1,394 @@
-// Unit tests for FileStorage::ProcessPromotionTasks. Uses a stub Client
-// that overrides the 4 promotion-RPC entry points so we can drive the
-// orchestration loop deterministically without standing up a master.
-
+// Deterministic promotion orchestration tests: block the SSD read with a latch,
+// observe the independent heartbeat, and release I/O before destroying buffers.
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-
 #include <atomic>
+#include <condition_variable>
+#include <future>
 #include <filesystem>
-#include <set>
-#include <thread>
-
+#include <mutex>
 #include "client_service.h"
 #include "file_storage.h"
 #include "storage_backend.h"
+#include "real_client.h"
+#include <async_simple/coro/SyncAwait.h>
 
 namespace mooncake {
-
 namespace fs_test {
-
-// Programmable fake. Each Set* method records what the next call should
-// return; the call itself records that it happened so tests can assert on
-// invocation count and ordering.
-class FakeClient : public Client {
+class FakeBackend : public StorageBackendInterface {
    public:
-    FakeClient()
-        : Client(/*local_hostname=*/"localhost:9003",
-                 /*metadata_connstring=*/"",
-                 /*protocol=*/"tcp",
-                 /*labels=*/{}) {}
-
-    // Drives the queue returned to the heartbeat caller.
-    std::vector<PromotionTaskItem> heartbeat_queue;
-    tl::expected<void, ErrorCode> heartbeat_result =
-        tl::expected<void, ErrorCode>{};
-
-    tl::expected<void, ErrorCode> PromotionObjectHeartbeat(
-        std::vector<PromotionTaskItem>& promotion_objects) override {
-        heartbeat_calls.fetch_add(1);
-        if (!heartbeat_result.has_value()) {
-            return tl::make_unexpected(heartbeat_result.error());
-        }
-        // Mirror production master: PromotionObjectHeartbeat returns at
-        // most kMaxPerHeartbeat keys per call (see
-        // MasterService::PromotionObjectHeartbeat) and leaves the rest
-        // queued for subsequent calls. Tests iterate by calling
-        // ProcessPromotionTasks multiple times until heartbeat_queue is
-        // empty.
-        constexpr size_t kMaxPerHeartbeat = 1;
-        promotion_objects.clear();
-        while (promotion_objects.size() < kMaxPerHeartbeat &&
-               !heartbeat_queue.empty()) {
-            promotion_objects.push_back(std::move(heartbeat_queue.back()));
-            heartbeat_queue.pop_back();
-        }
+    explicit FakeBackend(const FileStorageConfig& config)
+        : StorageBackendInterface(config) {}
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool blocked{false};
+    bool entered{false};
+    ErrorCode load_error{ErrorCode::OK};
+    tl::expected<void, ErrorCode> Init() override { return {}; }
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>&,
+        std::function<ErrorCode(const std::vector<std::string>&,
+                                std::vector<StorageObjectMetadata>&)>,
+        EvictionHandler) override {
+        return int64_t{0};
+    }
+    tl::expected<void, ErrorCode> BatchLoad(
+        std::unordered_map<std::string, Slice>&) override {
+        std::unique_lock lock(mutex);
+        entered = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return !blocked; });
+        if (load_error != ErrorCode::OK) return tl::make_unexpected(load_error);
         return {};
     }
-
-    // PromotionAllocStart: per-key dispatch table. Keys absent from
-    // alloc_overrides return the default response.
-    std::unordered_map<std::string, ErrorCode> alloc_overrides;
-    PromotionAllocStartResponse default_alloc_response;
-    bool default_alloc_succeeds = true;
-
-    tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
-        const std::string& key, uint64_t size,
-        const std::vector<std::string>& preferred_segments) override {
-        return PromotionAllocStart(key, "default", size, preferred_segments);
+    tl::expected<bool, ErrorCode> IsExist(const std::string&) override {
+        return true;
     }
-
-    tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
-        const std::string& key, const std::string& tenant_id, uint64_t size,
-        const std::vector<std::string>& preferred_segments) override {
-        (void)tenant_id;
-        (void)size;
-        (void)preferred_segments;
-        alloc_calls.fetch_add(1);
-        last_alloc_key = key;
-        auto it = alloc_overrides.find(key);
-        if (it != alloc_overrides.end()) {
-            return tl::make_unexpected(it->second);
-        }
-        if (!default_alloc_succeeds) {
-            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-        }
-        return default_alloc_response;
+    tl::expected<bool, ErrorCode> IsEnableOffloading() override {
+        return false;
     }
-
-    // PromotionWrite: per-key dispatch.
-    std::unordered_map<std::string, ErrorCode> write_overrides;
-    ErrorCode default_write_result = ErrorCode::OK;
-
-    ErrorCode PromotionWrite(const Replica::Descriptor&,
-                             std::vector<Slice>&) override {
-        write_calls.fetch_add(1);
-        auto it = write_overrides.find(last_alloc_key);
-        if (it != write_overrides.end()) {
-            return it->second;
-        }
-        return default_write_result;
-    }
-
-    std::unordered_map<std::string, ErrorCode> notify_overrides;
-    tl::expected<void, ErrorCode> default_notify_result =
-        tl::expected<void, ErrorCode>{};
-
-    tl::expected<void, ErrorCode> NotifyPromotionSuccess(
-        const std::string& key) override {
-        return NotifyPromotionSuccess(key, "default");
-    }
-
-    tl::expected<void, ErrorCode> NotifyPromotionSuccess(
-        const std::string& key, const std::string& tenant_id) override {
-        (void)tenant_id;
-        notify_calls.fetch_add(1);
-        notify_keys.push_back(key);
-        auto it = notify_overrides.find(key);
-        if (it != notify_overrides.end()) {
-            return tl::make_unexpected(it->second);
-        }
-        if (!default_notify_result.has_value()) {
-            return tl::make_unexpected(default_notify_result.error());
-        }
+    tl::expected<void, ErrorCode> ScanMeta(
+        const std::function<ErrorCode(const std::vector<std::string>&,
+                                      std::vector<StorageObjectMetadata>&)>&)
+        override {
         return {};
     }
-
-    // NotifyPromotionFailure: records calls so tests can assert that
-    // post-AllocStart failure paths in ProcessPromotionTasks actually
-    // notify the master.
-    tl::expected<void, ErrorCode> NotifyPromotionFailure(
-        const std::string& key) override {
-        return NotifyPromotionFailure(key, "default");
+    void Release() {
+        std::lock_guard lock(mutex);
+        blocked = false;
+        cv.notify_all();
     }
-
-    tl::expected<void, ErrorCode> NotifyPromotionFailure(
-        const std::string& key, const std::string& tenant_id) override {
-        (void)tenant_id;
-        notify_failure_calls.fetch_add(1);
-        notify_failure_keys.push_back(key);
-        return {};
+    bool WaitEntered() {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(3),
+                           [&] { return entered; });
     }
-
-    std::atomic<int> heartbeat_calls{0};
-    std::atomic<int> alloc_calls{0};
-    std::atomic<int> write_calls{0};
-    std::atomic<int> notify_calls{0};
-    std::atomic<int> notify_failure_calls{0};
-    std::vector<std::string> notify_keys;
-    std::vector<std::string> notify_failure_keys;
-    std::string last_alloc_key;
 };
 
+class FakeClient : public Client {
+   public:
+    FakeClient() : Client("localhost:9003", "", "tcp", {}) {}
+    std::vector<PromotionTaskItemV2> queue;
+    size_t batch_size{1};
+    ErrorCode heartbeat_error{ErrorCode::OK};
+    ErrorCode alloc_error{ErrorCode::OK};
+    ErrorCode write_error{ErrorCode::OK};
+    ErrorCode success_error{ErrorCode::OK};
+    std::atomic<int> polls{0}, offload_polls{0}, allocations{0}, writes{0},
+        successes{0}, failures{0};
+    UUID last_token{};
+    std::mutex mutex;
+    std::condition_variable cv;
+    tl::expected<void, ErrorCode> PromotionObjectHeartbeatV2(
+        std::vector<PromotionTaskItemV2>& tasks) override {
+        std::lock_guard lock(mutex);
+        ++polls;
+        cv.notify_all();
+        if (heartbeat_error != ErrorCode::OK)
+            return tl::make_unexpected(heartbeat_error);
+        while (!queue.empty() && tasks.size() < batch_size) {
+            tasks.push_back(queue.back());
+            queue.pop_back();
+        }
+        return {};
+    }
+    tl::expected<void, ErrorCode> OffloadObjectHeartbeat(
+        bool, std::vector<OffloadTaskItem>&) override {
+        ++offload_polls;
+        return {};
+    }
+    tl::expected<bool, ErrorCode> PollRemoveAll() override { return false; }
+    tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStartV2(
+        const std::string&, const std::string&, uint64_t,
+        const std::vector<std::string>&, const UUID& token) override {
+        ++allocations;
+        last_token = token;
+        if (alloc_error != ErrorCode::OK)
+            return tl::make_unexpected(alloc_error);
+        return PromotionAllocStartResponse{};
+    }
+    ErrorCode PromotionWrite(const Replica::Descriptor&,
+                             std::vector<Slice>&) override {
+        ++writes;
+        return write_error;
+    }
+    tl::expected<void, ErrorCode> NotifyPromotionSuccessV2(
+        const std::string&, const std::string&, const UUID& token) override {
+        last_token = token;
+        ++successes;
+        if (success_error != ErrorCode::OK)
+            return tl::make_unexpected(success_error);
+        return {};
+    }
+    tl::expected<void, ErrorCode> NotifyPromotionFailureV2(
+        const std::string&, const std::string&, const UUID& token) override {
+        last_token = token;
+        ++failures;
+        return {};
+    }
+    bool WaitPolls(int count) {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(3),
+                           [&] { return polls >= count; });
+    }
+};
 }  // namespace fs_test
 
 class FileStoragePromotionTest : public ::testing::Test {
    protected:
-    std::string data_path;
-    std::shared_ptr<fs_test::FakeClient> fake;
-    std::unique_ptr<FileStorage> file_storage;
-
+    std::shared_ptr<fs_test::FakeClient> client;
+    std::shared_ptr<fs_test::FakeBackend> backend;
+    std::unique_ptr<FileStorage> storage;
+    const UUID token{17, 29};
     void SetUp() override {
         google::InitGoogleLogging("FileStoragePromotionTest");
-        FLAGS_logtostderr = true;
-        unsetenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH");
-
-        data_path = std::filesystem::current_path().string() + "/data_prom";
-        std::filesystem::create_directories(data_path);
-        for (const auto& entry :
-             std::filesystem::directory_iterator(data_path)) {
-            if (entry.is_regular_file()) std::filesystem::remove(entry.path());
-        }
-
-        FileStorageConfig cfg = FileStorageConfig::FromEnvironment();
-        cfg.storage_filepath = data_path;
+        FileStorageConfig cfg;
+        cfg.storage_filepath = std::filesystem::temp_directory_path().string();
         cfg.local_buffer_size = 4 * 1024 * 1024;
-        fake = std::make_shared<fs_test::FakeClient>();
-        file_storage =
-            std::make_unique<FileStorage>(cfg, fake, "localhost:9003");
+        cfg.heartbeat_interval_seconds =
+            30;  // tests must not wait for this interval
+        client = std::make_shared<fs_test::FakeClient>();
+        backend = std::make_shared<fs_test::FakeBackend>(cfg);
+        storage = std::make_unique<FileStorage>(cfg, client, "localhost:9003");
+        storage->storage_backend_ = backend;
+        storage->enable_offloading_ = false;
     }
-
     void TearDown() override {
-        file_storage.reset();
-        fake.reset();
+        if (backend) backend->Release();
+        storage.reset();
+        client.reset();
+        backend.reset();
         google::ShutdownGoogleLogging();
-        for (const auto& entry :
-             std::filesystem::directory_iterator(data_path)) {
-            if (entry.is_regular_file()) std::filesystem::remove(entry.path());
-        }
     }
-
-    tl::expected<void, ErrorCode> CallProcessPromotionTasks() {
-        return file_storage->ProcessPromotionTasks();
+    void Queue(int count = 1, int64_t size = 1024) {
+        for (int i = 0; i < count; ++i)
+            client->queue.push_back(
+                {"default", "key" + std::to_string(i), size, token});
     }
-
-    // Drain a multi-key queue across multiple ticks. ProcessPromotionTasks
-    // caps work at 1 task/tick (heartbeat-safety) and the FakeClient's
-    // PromotionObjectHeartbeat mirrors production by clearing the queue on
-    // drain. So the test fixture has to push the remaining keys back
-    // between ticks, the same way the master would re-push if the gate
-    // re-fires. We track which key was processed via fake->last_alloc_key
-    // and remove it from the working set.
-    tl::expected<void, ErrorCode> DrainAllPromotionTasks(
-        std::unordered_map<std::string, int64_t> remaining) {
-        tl::expected<void, ErrorCode> last_res{};
-        while (!remaining.empty()) {
-            std::string before = fake->last_alloc_key;
-            fake->heartbeat_queue.clear();
-            fake->heartbeat_queue.reserve(remaining.size());
-            for (const auto& [key, size] : remaining) {
-                fake->heartbeat_queue.push_back(PromotionTaskItem{
-                    .tenant_id = "default", .key = key, .size = size});
-            }
-            last_res = CallProcessPromotionTasks();
-            if (!last_res.has_value()) return last_res;
-            if (fake->last_alloc_key == before ||
-                !remaining.contains(fake->last_alloc_key)) {
-                // No forward progress (e.g., empty effective queue / size<=0
-                // skip on every key); avoid infinite loop.
-                break;
-            }
-            remaining.erase(fake->last_alloc_key);
-        }
-        return last_res;
+    auto Process(bool* progressed = nullptr) {
+        return storage->ProcessPromotionTasks(progressed);
+    }
+    void Start() { storage->StartPromotionWorker(); }
+    void Stop() { storage->StopPromotionWorker(); }
+    auto Heartbeat() { return storage->Heartbeat(); }
+    void Drain() { storage->draining_.store(true); }
+    bool HasClient(const FileStorage& value) {
+        return value.client_ != nullptr;
+    }
+    void SetRescan(std::future<void> future) {
+        storage->rescan_future_ = std::move(future);
     }
 };
 
-// Empty heartbeat queue: do nothing past the heartbeat call.
-TEST_F(FileStoragePromotionTest, EmptyQueueIsNoOp) {
-    fake->heartbeat_queue = {};
-    auto res = CallProcessPromotionTasks();
-    EXPECT_TRUE(res.has_value());
-    EXPECT_EQ(fake->heartbeat_calls.load(), 1);
-    EXPECT_EQ(fake->alloc_calls.load(), 0);
-    EXPECT_EQ(fake->write_calls.load(), 0);
-    EXPECT_EQ(fake->notify_calls.load(), 0);
+TEST_F(FileStoragePromotionTest, EmptyAndRpcErrorsBackOffWithoutAllocation) {
+    bool progressed = true;
+    EXPECT_TRUE(Process(&progressed));
+    EXPECT_FALSE(progressed);
+    client->heartbeat_error = ErrorCode::SEGMENT_NOT_FOUND;
+    EXPECT_TRUE(Process());
+    client->heartbeat_error = ErrorCode::INTERNAL_ERROR;
+    EXPECT_FALSE(Process());
+    EXPECT_EQ(client->allocations, 0);
 }
 
-// Heartbeat returns SEGMENT_NOT_FOUND (transient post-restart):
-// swallow silently, no error to caller.
-TEST_F(FileStoragePromotionTest, HeartbeatSegmentNotFoundIsBenign) {
-    fake->heartbeat_result = tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    auto res = CallProcessPromotionTasks();
-    EXPECT_TRUE(res.has_value());
-    EXPECT_EQ(fake->alloc_calls.load(), 0);
+TEST_F(FileStoragePromotionTest, InvalidSizeReleasesAdmissionWithSameToken) {
+    Queue(1, 0);
+    EXPECT_TRUE(Process());
+    EXPECT_EQ(client->allocations, 0);
+    EXPECT_EQ(client->failures, 1);
+    EXPECT_EQ(client->last_token, token);
 }
 
-// Heartbeat returns a non-benign error: propagate it.
-TEST_F(FileStoragePromotionTest, HeartbeatHardErrorPropagates) {
-    fake->heartbeat_result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    auto res = CallProcessPromotionTasks();
-    ASSERT_FALSE(res.has_value());
-    EXPECT_EQ(res.error(), ErrorCode::INTERNAL_ERROR);
-    EXPECT_EQ(fake->alloc_calls.load(), 0);
+TEST_F(FileStoragePromotionTest, ReadFailureDoesNotAllocateRemoteMemory) {
+    Queue();
+    backend->load_error = ErrorCode::OBJECT_NOT_FOUND;
+    EXPECT_TRUE(Process());
+    EXPECT_EQ(client->allocations, 0);
+    EXPECT_EQ(client->writes, 0);
+    EXPECT_EQ(client->failures, 1);
+    EXPECT_EQ(client->last_token, token);
 }
 
-// Non-positive size in queue: skip that key, continue.
-TEST_F(FileStoragePromotionTest, NonPositiveSizeSkipped) {
-    fake->heartbeat_queue = {
-        {.tenant_id = "default", .key = "k_bad", .size = 0},
-        {.tenant_id = "default", .key = "k_good", .size = 1024}};
-    auto res = CallProcessPromotionTasks();
-    EXPECT_TRUE(res.has_value());
-    // Only k_good should reach AllocStart.
-    EXPECT_EQ(fake->alloc_calls.load(), 1);
-    EXPECT_EQ(fake->last_alloc_key, "k_good");
+TEST_F(FileStoragePromotionTest,
+       AllocationWriteAndCommitFailuresReleaseExactlyOnce) {
+    for (int failure = 0; failure < 3; ++failure) {
+        Queue();
+        client->alloc_error =
+            failure == 0 ? ErrorCode::NO_AVAILABLE_HANDLE : ErrorCode::OK;
+        client->write_error =
+            failure == 1 ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK;
+        client->success_error =
+            failure == 2 ? ErrorCode::INTERNAL_ERROR : ErrorCode::OK;
+        bool progressed = true;
+        EXPECT_TRUE(Process(&progressed));
+        EXPECT_FALSE(progressed);
+        EXPECT_EQ(client->failures, failure + 1);
+    }
+    EXPECT_EQ(client->allocations, 3);
+    EXPECT_EQ(client->writes, 2);
+    EXPECT_EQ(client->successes, 1);
+    EXPECT_EQ(client->last_token, token);
 }
 
-// PromotionAllocStart fails (e.g. master out of DRAM): skip key, no
-// write, no notify, advance to next.
-TEST_F(FileStoragePromotionTest, AllocStartFailureSkipsKey) {
-    fake->alloc_overrides["k1"] = ErrorCode::NO_AVAILABLE_HANDLE;
-    auto res = DrainAllPromotionTasks({{"k1", 1024}, {"k2", 1024}});
-    EXPECT_TRUE(res.has_value());
-    EXPECT_EQ(fake->alloc_calls.load(), 2);
-    // k1's failure prevents its write+notify; k2 succeeds (then fails at
-    // BatchLoad because the SSD file doesn't exist).
-    EXPECT_LE(fake->write_calls.load(), 1);
-    EXPECT_LE(fake->notify_calls.load(), 1);
+TEST_F(FileStoragePromotionTest,
+       SuccessfulBacklogDrainsWithoutHeartbeatInterval) {
+    Queue(5);
+    Start();
+    ASSERT_TRUE(
+        client->WaitPolls(6));  // 5 successful tasks then empty; no 30s wait
+    Stop();
+    EXPECT_EQ(client->successes, 5);
+    EXPECT_EQ(client->failures, 0);
+    EXPECT_EQ(client->polls, 6);  // idle worker does not spin
 }
 
-// BatchLoad failure (SSD file missing): no PromotionWrite, no Notify.
-// Master-side reaper handles the orphaned PROCESSING replica.
-TEST_F(FileStoragePromotionTest, BatchLoadFailureLeavesNoNotify) {
-    fake->heartbeat_queue = {
-        {.tenant_id = "default", .key = "k_missing", .size = 1024}};
-    // Default alloc succeeds; BatchLoad will fail because there's no file
-    // at data_path/k_missing for the storage backend to read.
-    auto res = CallProcessPromotionTasks();
-    EXPECT_TRUE(res.has_value());  // ProcessPromotionTasks itself is best-
-                                   // effort; per-key failures are warnings.
-    EXPECT_EQ(fake->alloc_calls.load(), 1);
-    EXPECT_EQ(fake->write_calls.load(), 0)
-        << "TransferWrite must not run if BatchLoad failed";
-    EXPECT_EQ(fake->notify_calls.load(), 0)
-        << "NotifyPromotionSuccess must not run if BatchLoad failed";
+TEST_F(FileStoragePromotionTest,
+       SlowSsdReadDoesNotBlockOffloadHeartbeatOrAllocateTarget) {
+    Queue();
+    backend->blocked = true;
+    Start();
+    ASSERT_TRUE(backend->WaitEntered());
+    EXPECT_EQ(client->allocations, 0);
+    auto heartbeat =
+        std::async(std::launch::async, [&] { return Heartbeat(); });
+    const auto status = heartbeat.wait_for(std::chrono::seconds(2));
+    backend->Release();  // unblock even on failure so the test cannot hang
+    EXPECT_EQ(status, std::future_status::ready);
+    EXPECT_TRUE(heartbeat.get());
+    Stop();
+    EXPECT_EQ(client->offload_polls, 1);
 }
 
-// PromotionWrite failure: no Notify.
-TEST_F(FileStoragePromotionTest, TransferWriteFailureLeavesNoNotify) {
-    fake->heartbeat_queue = {
-        {.tenant_id = "default", .key = "k_te_fail", .size = 1024}};
-    fake->default_write_result = ErrorCode::TRANSFER_FAIL;
-    auto res = CallProcessPromotionTasks();
-    EXPECT_TRUE(res.has_value());
-    EXPECT_EQ(fake->alloc_calls.load(), 1);
-    // Whether write_calls is 0 or 1 depends on whether BatchLoad succeeded
-    // first; either way Notify must not fire.
-    EXPECT_EQ(fake->notify_calls.load(), 0)
-        << "NotifyPromotionSuccess must not run on TransferWrite failure";
+TEST_F(FileStoragePromotionTest, ShutdownWaitsForIoAndPreventsNewTask) {
+    Queue(3);
+    client->batch_size = 3;
+    backend->blocked = true;
+    Start();
+    ASSERT_TRUE(backend->WaitEntered());
+    auto stop = std::async(std::launch::async, [&] { Stop(); });
+    EXPECT_EQ(stop.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+    backend->Release();
+    EXPECT_EQ(stop.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    stop.get();
+    EXPECT_EQ(client->polls, 1);
+    EXPECT_EQ(client->allocations, 0);
+    EXPECT_EQ(client->failures, 3);
 }
 
-// NotifyPromotionSuccess failure: logged, but processing of remaining
-// keys continues.
-TEST_F(FileStoragePromotionTest, NotifyFailureDoesNotAbortBatch) {
-    fake->notify_overrides["k1"] = ErrorCode::OBJECT_NOT_FOUND;
-    auto res = DrainAllPromotionTasks({{"k1", 1024}, {"k2", 1024}});
-    EXPECT_TRUE(res.has_value());
-    EXPECT_EQ(fake->alloc_calls.load(), 2)
-        << "Both keys must be alloc-attempted regardless of k1's notify "
-        << "failure";
+TEST_F(FileStoragePromotionTest,
+       DrainDuringReadReleasesWithoutAllocatingTarget) {
+    Queue();
+    backend->blocked = true;
+    Start();
+    ASSERT_TRUE(backend->WaitEntered());
+    Drain();
+    backend->Release();
+    Stop();
+    EXPECT_EQ(client->allocations, 0);
+    EXPECT_EQ(client->failures, 1);
 }
 
-// Per-key independence: failures on one key don't prevent attempts on
-// others.
-TEST_F(FileStoragePromotionTest, PerKeyFailuresAreIndependent) {
-    fake->alloc_overrides["k_alloc_fail"] = ErrorCode::NO_AVAILABLE_HANDLE;
-    fake->write_overrides["k_write_fail"] = ErrorCode::TRANSFER_FAIL;
-    auto res = DrainAllPromotionTasks({
-        {"k_alloc_fail", 1024},
-        {"k_write_fail", 1024},
-        {"k_normal", 1024},
+TEST_F(FileStoragePromotionTest, AllocationPressureDoesNotHotLoop) {
+    Queue(5);
+    client->alloc_error = ErrorCode::NO_AVAILABLE_HANDLE;
+    Start();
+    ASSERT_TRUE(client->WaitPolls(1));
+    Stop();
+    EXPECT_EQ(client->polls, 1);
+    EXPECT_EQ(client->failures, 1);
+}
+
+TEST_F(FileStoragePromotionTest,
+       ExplicitCloseJoinsRetainedStorageBeforePoolFree) {
+    Queue();
+    backend->blocked = true;
+    Start();
+    ASSERT_TRUE(backend->WaitEntered());
+    RealClient owner;
+    owner.client_ = client;
+    auto retained = std::shared_ptr<FileStorage>(storage.release());
+    owner.file_storage_ = retained;
+    owner.segment_ptrs_.emplace_back(std::malloc(4096));
+    auto close =
+        std::async(std::launch::async, [&] { return owner.tearDownAll(); });
+    const auto state = close.wait_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(state, std::future_status::timeout);
+    if (state == std::future_status::timeout)
+        EXPECT_EQ(owner.segment_ptrs_.size(), 1);
+    backend->Release();
+    EXPECT_EQ(close.get(), 0);
+    EXPECT_TRUE(owner.segment_ptrs_.empty());
+    EXPECT_FALSE(HasClient(*retained));
+    EXPECT_EQ(client->allocations, 0);
+    EXPECT_EQ(client->failures, 1);
+    retained->Shutdown();
+    EXPECT_EQ(owner.tearDownAll(), 0);
+}
+
+TEST_F(FileStoragePromotionTest,
+       CloseDrainsAdmittedAsyncOffloadAndRejectsNewRpc) {
+    backend->blocked = true;
+    RealClient owner;
+    owner.client_ = client;
+    auto retained = std::shared_ptr<FileStorage>(storage.release());
+    owner.file_storage_ = retained;
+    owner.segment_ptrs_.emplace_back(std::malloc(4096));
+    auto request = std::async(std::launch::async, [&] {
+        return async_simple::coro::syncAwait(
+            owner.batch_get_offload_object({"key"}, {1024}));
     });
-    EXPECT_TRUE(res.has_value());
-    // All three reach AllocStart.
-    EXPECT_EQ(fake->alloc_calls.load(), 3);
+    const bool entered = backend->WaitEntered();
+    if (!entered) backend->Release();
+    EXPECT_TRUE(entered);
+    auto close =
+        std::async(std::launch::async, [&] { return owner.tearDownAll(); });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!owner.closed_.load() &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    const bool admission_closed = owner.closed_.load();
+    if (!admission_closed) backend->Release();
+    EXPECT_TRUE(admission_closed);
+    const auto state = close.wait_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(state, std::future_status::timeout);
+    if (entered && admission_closed && state == std::future_status::timeout) {
+        EXPECT_EQ(owner.segment_ptrs_.size(), 1);
+        EXPECT_FALSE(owner.release_offload_buffer(0));
+        EXPECT_FALSE(async_simple::coro::syncAwait(
+            owner.batch_get_offload_object({"rejected"}, {1024})));
+    }
+    backend->Release();
+    EXPECT_TRUE(request.get());
+    EXPECT_EQ(close.get(), 0);
+    EXPECT_TRUE(owner.segment_ptrs_.empty());
+    EXPECT_FALSE(HasClient(*retained));
+    EXPECT_EQ(owner.active_offload_rpcs_, 0);
 }
 
-// Every post-admission failure path (including PromotionAllocStart's
-// own failure) must call NotifyPromotionFailure so the master releases
-// the task slot immediately. Without this, the slot stays pinned until
-// put_start_release_timeout_sec_ (~10 min default), turning a transient
-// DRAM-pressure spike into a sustained outage of promotion_queue_limit_.
-TEST_F(FileStoragePromotionTest, AllocStartFailureNotifiesMaster) {
-    fake->heartbeat_queue = {
-        {.tenant_id = "default", .key = "k_alloc_fail", .size = 1024}};
-    fake->alloc_overrides["k_alloc_fail"] = ErrorCode::NO_AVAILABLE_HANDLE;
-    auto res = CallProcessPromotionTasks();
-    EXPECT_TRUE(res.has_value());
-    EXPECT_EQ(fake->alloc_calls.load(), 1);
-    EXPECT_EQ(fake->notify_calls.load(), 0)
-        << "Success-notify must not fire on AllocStart failure.";
-    EXPECT_EQ(fake->notify_failure_calls.load(), 1)
-        << "AllocStart failure must invoke NotifyPromotionFailure so the "
-        << "master can release the task slot immediately. Without this "
-        << "the slot is pinned for ~10 min and transient DRAM pressure "
-        << "saturates promotion_queue_limit_ for the same window.";
-    ASSERT_EQ(fake->notify_failure_keys.size(), 1u);
-    EXPECT_EQ(fake->notify_failure_keys[0], "k_alloc_fail");
+TEST_F(FileStoragePromotionTest, ShutdownWaitsForMetadataRescan) {
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto released = release.get_future();
+    SetRescan(std::async(std::launch::async, [&] {
+        entered.set_value();
+        released.wait();
+    }));
+    entered.get_future().wait();
+    auto shutdown =
+        std::async(std::launch::async, [&] { storage->Shutdown(); });
+    EXPECT_EQ(shutdown.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+    release.set_value();
+    shutdown.get();
+    EXPECT_FALSE(HasClient(*storage));
+    EXPECT_FALSE(Heartbeat());
+    EXPECT_EQ(client->offload_polls, 0);
+    storage->Shutdown();
 }
-
-// Same invariant on the post-AllocStart paths (BatchLoad /
-// TransferWrite / Notify-Success). Each failure mode must release the
-// master slot. Exercises three modes (AllocStart itself, missing-file
-// BatchLoad, override on Notify) by draining across successive
-// heartbeats (the FakeClient mirrors the master's kMaxPerHeartbeat = 1
-// cap) and verifies each one releases.
-TEST_F(FileStoragePromotionTest, PostAllocFailuresAllNotifyMaster) {
-    fake->alloc_overrides["k_alloc_fail"] = ErrorCode::NO_AVAILABLE_HANDLE;
-    // k_load_fail: no override -> AllocStart succeeds, but BatchLoad
-    // will fail because no SSD file exists for this key in data_path.
-    // k_notify_fail: AllocStart and BatchLoad and TransferWrite all
-    // succeed; Notify is overridden to fail.
-    fake->notify_overrides["k_notify_fail"] = ErrorCode::OBJECT_NOT_FOUND;
-
-    auto res = DrainAllPromotionTasks({
-        {"k_alloc_fail", 1024},
-        {"k_load_fail", 1024},
-        {"k_notify_fail", 1024},
-    });
-    EXPECT_TRUE(res.has_value());
-    EXPECT_EQ(fake->alloc_calls.load(), 3);
-
-    // Every failed key must have its slot released via Notify-Failure.
-    // k_notify_fail also counts: Notify-Success failed, so we still
-    // need to free the slot.
-    EXPECT_EQ(fake->notify_failure_calls.load(), 3)
-        << "All three failed promotions must each invoke "
-        << "NotifyPromotionFailure. If this fires with <3, one of the "
-        << "failure paths is still leaking the master slot.";
-    std::set<std::string> got(fake->notify_failure_keys.begin(),
-                              fake->notify_failure_keys.end());
-    EXPECT_EQ(got.count("k_alloc_fail"), 1u);
-    EXPECT_EQ(got.count("k_load_fail"), 1u);
-    EXPECT_EQ(got.count("k_notify_fail"), 1u);
-}
-
 }  // namespace mooncake
 
 int main(int argc, char** argv) {

@@ -4,6 +4,7 @@
 #include <functional>
 #include <boost/functional/hash.hpp>
 #include <memory>
+#include <list>
 #include <optional>
 #include <shared_mutex>
 #include <string_view>
@@ -27,11 +28,11 @@ class LocalSsdTaskMailbox {
     std::vector<OffloadTaskItem> SetOffloadingAndTakePending(bool enabled);
     bool RemoveOffload(const TenantId& tenant_id, std::string_view key);
 
-    ErrorCode EnqueuePromotion(PromotionTaskItem task);
+    ErrorCode EnqueuePromotion(PromotionTaskItem task, UUID task_id = {});
     std::vector<PromotionTaskItem> TakePromotions(size_t max_items);
+    std::vector<PromotionTaskItemV2> TakePromotionsV2(size_t max_items);
     bool RemovePromotion(const TenantId& tenant_id, std::string_view key);
-    // Re-mark a queued promotion as most-recently-touched. No-op (returns
-    // false) when the key is not queued, e.g. already taken by a heartbeat.
+    // Check whether a promotion is still queued without changing FIFO order.
     bool TouchPromotion(const TenantId& tenant_id, std::string_view key);
 
     void RequestRemoveAll();
@@ -42,17 +43,15 @@ class LocalSsdTaskMailbox {
     bool enable_offloading_ GUARDED_BY(mutex_);
     std::unordered_map<std::string, OffloadTaskItem> pending_offloads_
         GUARDED_BY(mutex_);
-    // Dedup map + recency order. seq is monotone; enqueue, a duplicate
-    // enqueue, and TouchPromotion all re-mark the entry with a fresh seq, so
-    // TakePromotions can deliver the most-recently-touched key first instead
-    // of an arbitrary (hash-order) one.
+    // FIFO admission order prevents a hot key from starving older work.
+    // The index permits constant-time cancellation with no stale tombstones.
     struct PromotionEntry {
-        PromotionTaskItem task;
-        uint64_t seq;
+        PromotionTaskItemV2 task;
+        std::list<std::string>::iterator position;
     };
+    std::list<std::string> promotion_order_ GUARDED_BY(mutex_);
     std::unordered_map<std::string, PromotionEntry> pending_promotions_
         GUARDED_BY(mutex_);
-    uint64_t promotion_seq_ GUARDED_BY(mutex_){0};
     bool pending_remove_all_ GUARDED_BY(mutex_){false};
 
     friend class LocalSsdManager;
@@ -97,8 +96,11 @@ class LocalSsdManager {
                                     const TenantId& tenant_id,
                                     std::string_view key);
 
-    ErrorCode EnqueuePromotion(const UUID& client_id, PromotionTaskItem task);
+    ErrorCode EnqueuePromotion(const UUID& client_id, PromotionTaskItem task,
+                               UUID task_id = {});
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode> TakePromotions(
+        const UUID& client_id, size_t max_items);
+    tl::expected<std::vector<PromotionTaskItemV2>, ErrorCode> TakePromotionsV2(
         const UUID& client_id, size_t max_items);
     bool RemovePromotion(const UUID& client_id, const TenantId& tenant_id,
                          std::string_view key);

@@ -13,6 +13,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -32,6 +33,22 @@ size_t CountPromotionTask(const std::vector<PromotionTaskItem>& tasks,
         [&key](const PromotionTaskItem& task) { return task.key == key; });
 }
 
+class PromotionExpiryLogSink : public google::LogSink {
+   public:
+    PromotionExpiryLogSink() { google::AddLogSink(this); }
+    ~PromotionExpiryLogSink() override { google::RemoveLogSink(this); }
+    void send(google::LogSeverity severity, const char*, const char*, int,
+              const struct tm*, const char* message, size_t length) override {
+        if (severity != google::GLOG_WARNING) return;
+        std::string text(message, length);
+        if (text.find("Promotion task exp") == std::string::npos) return;
+        std::lock_guard lock(mutex);
+        messages.push_back(std::move(text));
+    }
+    std::mutex mutex;
+    std::vector<std::string> messages;
+};
+
 class PromotionOnHitTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -45,6 +62,19 @@ class PromotionOnHitTest : public ::testing::Test {
             std::filesystem::remove(path, ec);
         }
         google::ShutdownGoogleLogging();
+    }
+
+    static void ExpirePromotionNow(MasterService& service,
+                                   const std::string& key) {
+        MasterService::MetadataAccessorRW accessor(
+            &service, MasterService::ObjectIdentity{
+                          .tenant_id = TenantId::Default(), .user_key = key});
+        auto& tasks = accessor.GetTenantState().promotion_tasks;
+        ASSERT_TRUE(tasks.contains(key));
+        tasks.at(key).start_time =
+            std::chrono::system_clock::now() - std::chrono::hours(1);
+        service.DiscardExpiredProcessingReplicas(
+            accessor.GetShard(), std::chrono::system_clock::now());
     }
 
     // Friend access to MasterService::promotion_admission_threshold_, which
@@ -749,6 +779,66 @@ TEST_F(PromotionOnHitTest, RacingReadersDedup) {
 //       permanent pin → eviction can still free it later);
 //   (b) the dedup gate is unblocked, so a subsequent read can re-enqueue
 //       the same key for retry.
+TEST_F(PromotionOnHitTest, ExpiryRemovesUntakenMailboxAndFencesOldCallbacks) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    auto service = std::make_unique<MasterService>(config);
+    auto ctx = PrepareSegment(*service, "fenced", kDefaultSegmentBase,
+                              16 * 1024 * 1024);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, ctx.client_id, "key", 1024,
+                                       ctx.segment_name));
+    ASSERT_TRUE(service->GetReplicaList("key", TenantId::Default()));
+    PromotionExpiryLogSink log_sink;
+    const auto expired_before =
+        MasterMetricManager::instance().get_promotion_expired();
+    ExpirePromotionNow(*service, "key");
+    auto empty = service->PromotionObjectHeartbeatV2(ctx.client_id);
+    ASSERT_TRUE(empty);
+    EXPECT_TRUE(empty->empty());
+
+    ASSERT_TRUE(service->GetReplicaList("key", TenantId::Default()));
+    auto old = service->PromotionObjectHeartbeatV2(ctx.client_id);
+    ASSERT_TRUE(old);
+    ASSERT_EQ(old->size(), 1);
+    const UUID old_id = old->front().task_id;
+    ExpirePromotionNow(*service, "key");
+    ASSERT_TRUE(service->GetReplicaList("key", TenantId::Default()));
+    auto fresh = service->PromotionObjectHeartbeatV2(ctx.client_id);
+    ASSERT_TRUE(fresh);
+    ASSERT_EQ(fresh->size(), 1);
+    const UUID new_id = fresh->front().task_id;
+    ASSERT_NE(old_id, new_id);
+    EXPECT_FALSE(service->PromotionAllocStart(
+        ctx.client_id, "key", TenantId::Default(), 1024, {}, old_id));
+    ASSERT_TRUE(service->PromotionAllocStart(
+        ctx.client_id, "key", TenantId::Default(), 1024, {}, new_id));
+    const auto bytes = service->QuerySegments(ctx.segment_name)->first;
+    EXPECT_FALSE(service->NotifyPromotionFailure(ctx.client_id, "key",
+                                                 TenantId::Default(), old_id));
+    EXPECT_FALSE(service->NotifyPromotionSuccess(ctx.client_id, "key",
+                                                 TenantId::Default(), old_id));
+    EXPECT_EQ(service->QuerySegments(ctx.segment_name)->first, bytes);
+    EXPECT_TRUE(
+        HasPromotionTaskForTesting(service.get(), TenantId::Default(), "key"));
+    EXPECT_TRUE(service->NotifyPromotionSuccess(ctx.client_id, "key",
+                                                TenantId::Default(), new_id));
+    EXPECT_FALSE(
+        HasPromotionTaskForTesting(service.get(), TenantId::Default(), "key"));
+    EXPECT_EQ(MasterMetricManager::instance().get_promotion_expired() -
+                  expired_before,
+              2);
+    {
+        std::lock_guard lock(log_sink.mutex);
+        ASSERT_EQ(log_sink.messages.size(), 1);
+        EXPECT_NE(log_sink.messages.front().find("expired_total="),
+                  std::string::npos);
+        EXPECT_EQ(log_sink.messages.front().find("key"), std::string::npos);
+    }
+    service->RemoveAll();
+}
+
 TEST_F(PromotionOnHitTest, StalePromotionReaper) {
     MasterServiceConfig config;
     config.enable_offload = true;

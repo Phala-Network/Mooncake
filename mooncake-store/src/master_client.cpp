@@ -238,6 +238,26 @@ struct RpcNameTraits<&WrappedMasterService::NotifyOffloadSuccess> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::PromotionObjectHeartbeatV2> {
+    static constexpr const char* value = "PromotionObjectHeartbeatV2";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::PromotionAllocStartV2> {
+    static constexpr const char* value = "PromotionAllocStartV2";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::NotifyPromotionSuccessV2> {
+    static constexpr const char* value = "NotifyPromotionSuccessV2";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::NotifyPromotionFailureV2> {
+    static constexpr const char* value = "NotifyPromotionFailureV2";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PromotionObjectHeartbeat> {
     static constexpr const char* value = "PromotionObjectHeartbeat";
 };
@@ -1131,6 +1151,36 @@ tl::expected<void, ErrorCode> MasterClient::NotifyPromotionFailure(
             client_id, key, tenant_id);
     timer.LogResponseExpected(result);
     return result;
+}
+
+tl::expected<std::vector<PromotionTaskItemV2>, ErrorCode>
+MasterClient::PromotionObjectHeartbeatV2(const UUID& client_id) {
+    return invoke_rpc<&WrappedMasterService::PromotionObjectHeartbeatV2,
+                      std::vector<PromotionTaskItemV2>>(client_id);
+}
+
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+MasterClient::PromotionAllocStartV2(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    uint64_t size, const std::vector<std::string>& preferred_segments,
+    const UUID& task_id) {
+    return invoke_rpc<&WrappedMasterService::PromotionAllocStartV2,
+                      PromotionAllocStartResponse>(
+        client_id, key, tenant_id, size, preferred_segments, task_id);
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccessV2(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    const UUID& task_id) {
+    return invoke_rpc<&WrappedMasterService::NotifyPromotionSuccessV2, void>(
+        client_id, key, tenant_id, task_id);
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyPromotionFailureV2(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    const UUID& task_id) {
+    return invoke_rpc<&WrappedMasterService::NotifyPromotionFailureV2, void>(
+        client_id, key, tenant_id, task_id);
 }
 
 tl::expected<CopyStartResponse, ErrorCode> MasterClient::CopyStart(
