@@ -3831,6 +3831,34 @@ void Client::SetDfsStorageBackend(
     EnsureStorageControlPlaneStarted();
 }
 
+tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeatV2(
+    std::vector<PromotionTaskItemV2>& tasks) {
+    auto response = master_client_.PromotionObjectHeartbeatV2(client_id_);
+    if (!response) return tl::make_unexpected(response.error());
+    tasks = std::move(response.value());
+    return {};
+}
+
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+Client::PromotionAllocStartV2(
+    const std::string& key, const std::string& tenant_id, uint64_t size,
+    const std::vector<std::string>& preferred_segments, const UUID& task_id) {
+    return master_client_.PromotionAllocStartV2(
+        client_id_, key, tenant_id, size, preferred_segments, task_id);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionSuccessV2(
+    const std::string& key, const std::string& tenant_id, const UUID& task_id) {
+    return master_client_.NotifyPromotionSuccessV2(client_id_, key, tenant_id,
+                                                   task_id);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionFailureV2(
+    const std::string& key, const std::string& tenant_id, const UUID& task_id) {
+    return master_client_.NotifyPromotionFailureV2(client_id_, key, tenant_id,
+                                                   task_id);
+}
+
 tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     std::vector<PromotionTaskItem>& promotion_objects) {
     auto response = master_client_.PromotionObjectHeartbeat(client_id_);

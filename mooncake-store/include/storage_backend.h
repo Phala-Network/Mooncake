@@ -1090,10 +1090,15 @@ class BucketStorageBackend : public StorageBackendInterface {
     // PrepareEviction removes buckets from metadata maps and returns this.
     // FinalizeEviction removes persisted metadata, waits for in-flight reads,
     // and then deletes the data files.
+    struct PendingBucket {
+        int64_t id;
+        std::shared_ptr<BucketMetadata> metadata;
+        std::vector<std::pair<std::string, StorageObjectMetadata>> objects;
+        int64_t evicted_size = 0;
+    };
+
     struct PendingEviction {
-        std::vector<std::string> keys;  // All keys in evicted buckets
-        std::vector<std::pair<int64_t, std::shared_ptr<BucketMetadata>>>
-            buckets;  // (bucket_id, metadata) for file deletion
+        std::vector<PendingBucket> buckets;
         std::vector<std::string> write_keys;
         int64_t evicted_size = 0;
         int64_t write_size = 0;
@@ -1112,9 +1117,10 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     void RestorePreparedEviction(PendingEviction&& pending);
 
-    void RestorePreparedEvictionLocked(PendingEviction&& pending);
+    tl::expected<void, ErrorCode> CompletePreparedEviction(
+        PendingEviction& pending, const EvictionHandler& eviction_handler);
 
-    void CommitPreparedEviction(const PendingEviction& pending);
+    void CommitPreparedEviction(const PendingBucket& bucket);
 
     void ReleasePreparedWrite(const PendingEviction& pending);
 
@@ -1127,7 +1133,7 @@ class BucketStorageBackend : public StorageBackendInterface {
      *         buckets_.end() if no candidate is available.
      */
     std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
-    SelectEvictionCandidate();
+    SelectEvictionCandidate(const std::unordered_set<int64_t>& skipped);
 
     /**
      * @brief Actual on-disk bytes of the offload directory, measured by
@@ -1156,8 +1162,7 @@ class BucketStorageBackend : public StorageBackendInterface {
      * Must be called AFTER master has been notified via eviction_handler.
      * @param pending The result of a prior PrepareEviction call.
      */
-    tl::expected<void, ErrorCode> FinalizeEviction(
-        const PendingEviction& pending);
+    tl::expected<void, ErrorCode> FinalizeEviction(const PendingBucket& bucket);
 
    public:
     /**
@@ -1206,6 +1211,10 @@ class BucketStorageBackend : public StorageBackendInterface {
      * - total_size_: cumulative data size of all stored objects
      */
     mutable SharedMutex mutex_;
+    // Prepare-only serialization. Lock order: eviction_prepare_mutex_, then
+    // mutex_. No holder of mutex_ may acquire eviction_prepare_mutex_, and
+    // notification/Commit/Restore/Finalize never acquire this mutex.
+    Mutex eviction_prepare_mutex_;
     mutable Mutex iterator_mutex_;
     std::string storage_path_;
     int64_t total_size_ GUARDED_BY(mutex_) = 0;

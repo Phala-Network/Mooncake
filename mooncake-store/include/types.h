@@ -247,6 +247,15 @@ struct PromotionTaskItem {
 };
 YLT_REFL(PromotionTaskItem, tenant_id, key, size);
 
+// Separate wire type: legacy promotion RPC layouts remain unchanged.
+struct PromotionTaskItemV2 {
+    std::string tenant_id;
+    std::string key;
+    int64_t size;
+    UUID task_id;
+};
+YLT_REFL(PromotionTaskItemV2, tenant_id, key, size, task_id);
+
 // Store client configuration validation limits
 static constexpr size_t MIN_SEGMENT_SIZE = 1024;                          // 1KB
 static constexpr size_t MAX_SEGMENT_SIZE = 1024ULL * 1024 * 1024 * 1024;  // 1TB

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <condition_variable>
+#include <mutex>
+
 #include "client_service.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
@@ -145,25 +148,16 @@ class FileStorage {
      * client.
      * 2. Receives feedback on which objects should be offloaded.
      * 3. Triggers asynchronous offloading of pending objects.
-     * 4. If offload work was returned, pulls and processes any pending L2->L1
-     *    promotion tasks queued by the master (mirror of step 1+2 in the
-     *    reverse direction).
-     * 5. Runs proactive local-disk watermark eviction.
+     * 4. Runs proactive local-disk watermark eviction. Promotion work runs
+     *    independently on its own serial worker.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> Heartbeat();
 
-    /**
-     * @brief Drives the L2->L1 promotion pipeline for one heartbeat tick.
-     * Pulls promotion work from the master, stages a MEMORY replica for each
-     * key, copies the bytes from local SSD into that replica, and notifies the
-     * master on success. A failure on any single key is logged and skipped;
-     * the master-side reaper decrements the source replica's refcnt and
-     * erases the task entry on TTL expiry, and any orphaned PROCESSING
-     * MEMORY replica is reaped via the standard discarded-replicas path.
-     * @return tl::expected<void, ErrorCode> indicating operation status.
-     */
-    tl::expected<void, ErrorCode> ProcessPromotionTasks();
+    // Run one bounded promotion batch. Only successful completions request
+    // immediate follow-up; idle and error batches use worker backoff.
+    tl::expected<void, ErrorCode> ProcessPromotionTasks(
+        bool* progressed = nullptr);
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
@@ -214,9 +208,16 @@ class FileStorage {
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
-    std::atomic<bool> heartbeat_running_;
+    void StartPromotionWorker();
+    void StopPromotionWorker();
+    std::mutex promotion_worker_mutex_;
+    std::condition_variable promotion_worker_cv_;
+    bool promotion_worker_stopping_{true};
+    std::atomic<bool> promotion_stop_requested_{false};
+    std::thread promotion_thread_;
+    std::atomic<bool> heartbeat_running_{false};
     std::thread heartbeat_thread_;
-    std::atomic<bool> client_buffer_gc_running_;
+    std::atomic<bool> client_buffer_gc_running_{false};
     std::thread client_buffer_gc_thread_;
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};

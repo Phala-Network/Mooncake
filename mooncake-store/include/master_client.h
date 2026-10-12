@@ -473,6 +473,20 @@ class MasterClient {
      * promotion. Returns the new replica's descriptor that the caller writes
      * via Transfer Engine.
      */
+    tl::expected<std::vector<PromotionTaskItemV2>, ErrorCode>
+    PromotionObjectHeartbeatV2(const UUID& client_id);
+    tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStartV2(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, uint64_t size,
+        const std::vector<std::string>& preferred_segments,
+        const UUID& task_id);
+    tl::expected<void, ErrorCode> NotifyPromotionSuccessV2(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const UUID& task_id);
+    tl::expected<void, ErrorCode> NotifyPromotionFailureV2(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const UUID& task_id);
+
     [[nodiscard]] tl::expected<PromotionAllocStartResponse, ErrorCode>
     PromotionAllocStart(const UUID& client_id, const std::string& key,
                         uint64_t size,

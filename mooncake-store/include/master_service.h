@@ -810,6 +810,9 @@ class MasterService {
      * map remains populated as the source of truth until NotifyPromotionSuccess
      * commits the new MEMORY replica.
      */
+    auto PromotionObjectHeartbeatV2(const UUID& client_id)
+        -> tl::expected<std::vector<PromotionTaskItemV2>, ErrorCode>;
+
     auto PromotionObjectHeartbeat(const UUID& client_id)
         -> tl::expected<std::vector<PromotionTaskItem>, ErrorCode>;
 
@@ -827,7 +830,8 @@ class MasterService {
      */
     auto PromotionAllocStart(const UUID& client_id, const std::string& key,
                              const TenantId& tenant_id, uint64_t size,
-                             const std::vector<std::string>& preferred_segments)
+                             const std::vector<std::string>& preferred_segments,
+                             std::optional<UUID> task_id = std::nullopt)
         -> tl::expected<PromotionAllocStartResponse, ErrorCode>;
 
     /**
@@ -836,7 +840,8 @@ class MasterService {
      * NotifyOffloadSuccess.
      */
     auto NotifyPromotionSuccess(const UUID& client_id, const std::string& key,
-                                const TenantId& tenant_id)
+                                const TenantId& tenant_id,
+                                std::optional<UUID> task_id = std::nullopt)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -858,7 +863,8 @@ class MasterService {
      * holder's promotion_objects entry.
      */
     auto NotifyPromotionFailure(const UUID& client_id, const std::string& key,
-                                const TenantId& tenant_id)
+                                const TenantId& tenant_id,
+                                std::optional<UUID> task_id = std::nullopt)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -1642,6 +1648,7 @@ class MasterService {
         uint64_t object_size;
         uint64_t pending_quota_charge_bytes{0};
         std::chrono::system_clock::time_point start_time;
+        UUID task_id;
         UUID holder_id;  // owner of source LOCAL_DISK; only Notifier allowed
         // Execution failures so far in this admission chain. Read by
         // NotifyPromotionFailure before the task is erased and re-recorded as
@@ -2065,7 +2072,8 @@ class MasterService {
      * recording the task in the shard's promotion_tasks map.
      */
     tl::expected<void, ErrorCode> PushPromotionQueue(
-        const ObjectIdentity& object_id, Replica& source_replica);
+        const ObjectIdentity& object_id, Replica& source_replica,
+        const UUID& task_id);
 
     /**
      * @brief Helper invoked from GetReplicaList when an only-LOCAL_DISK key is
@@ -2104,6 +2112,14 @@ class MasterService {
         NO_THREAD_SAFETY_ANALYSIS {
         auto task_it = tenant_state.promotion_tasks.find(key);
         if (task_it != tenant_state.promotion_tasks.end()) {
+            // Cancellation and mailbox removal share the metadata shard lock:
+            // a stale FIFO head must not consume the next heartbeat's batch.
+            auto metadata_it = tenant_state.metadata.find(key);
+            if (metadata_it != tenant_state.metadata.end()) {
+                local_ssd_manager_.RemovePromotion(
+                    task_it->second.holder_id, metadata_it->second.tenant_id,
+                    key);
+            }
             ReleaseTenantQuota(
                 GetBoundTenantQuotaHandle(tenant_state),
                 std::exchange(task_it->second.pending_quota_charge_bytes, 0));
@@ -2528,6 +2544,7 @@ class MasterService {
     // successful enqueue; decremented in NotifyPromotionSuccess and in the
     // promotion task reaper after the task entry is erased. Relaxed memory
     // order is safe — the value is an advisory soft cap, not a barrier.
+    std::atomic<int64_t> promotion_expiry_last_log_sec_{0};
     std::atomic<uint64_t> promotion_in_flight_{0};
     // Promotion retry candidate state.
     std::atomic<uint64_t> promotion_candidate_count_{0};

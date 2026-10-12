@@ -13,6 +13,7 @@
 #include "rpc_helper.h"
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
+#include "utils/disk_eviction_error_summary.h"
 #include "version.h"
 
 namespace mooncake {
@@ -1326,14 +1327,14 @@ WrappedMasterService::BatchEvictDiskReplica(
         });
 
     size_t failure_count = 0;
+    DiskEvictionErrorSummary errors;
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
             failure_count++;
-            LOG(WARNING) << "BatchEvictDiskReplica failed for key[" << i
-                         << "] '" << keys[i]
-                         << "': " << toString(results[i].error());
+            errors.Record(results[i].error(), i);
         }
     }
+    errors.Log("BatchEvictDiskReplica", total_keys);
     if (failure_count > 0) {
         MasterMetricManager::instance().inc_evict_disk_replica_failures();
     }
@@ -1688,6 +1689,63 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionFailure(
     return result;
 }
 
+tl::expected<std::vector<PromotionTaskItemV2>, ErrorCode>
+WrappedMasterService::PromotionObjectHeartbeatV2(const UUID& client_id) {
+    ScopedVLogTimer timer(1, "PromotionObjectHeartbeat");
+    timer.LogRequest("action=promotion_object_heartbeat");
+    return master_service_.PromotionObjectHeartbeatV2(client_id);
+}
+
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+WrappedMasterService::PromotionAllocStartV2(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    uint64_t size, const std::vector<std::string>& preferred_segments,
+    const UUID& task_id) {
+    ScopedVLogTimer timer(1, "PromotionAllocStart");
+    timer.LogRequest("action=promotion_alloc_start");
+    auto result =
+        WithWriteTenant(tenant_id, master_service_.IsTenantQuotaEnabled(),
+                        [&](const TenantId& resolved_tenant_id) {
+                            return master_service_.PromotionAllocStart(
+                                client_id, key, resolved_tenant_id, size,
+                                preferred_segments, task_id);
+                        });
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionSuccessV2(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    const UUID& task_id) {
+    ScopedVLogTimer timer(1, "NotifyPromotionSuccess");
+    timer.LogRequest("action=notify_promotion_success");
+    auto result = WithRequestTenant(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        [&](const TenantId& resolved_tenant_id) {
+            return master_service_.NotifyPromotionSuccess(
+                client_id, key, resolved_tenant_id, task_id);
+        });
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionFailureV2(
+    const UUID& client_id, const std::string& key, const std::string& tenant_id,
+    const UUID& task_id) {
+    ScopedVLogTimer timer(1, "NotifyPromotionFailure");
+    timer.LogRequest("action=notify_promotion_failure");
+    auto result = WithRequestTenant(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        [&](const TenantId& resolved_tenant_id) {
+            return master_service_.NotifyPromotionFailure(
+                client_id, key, resolved_tenant_id, task_id);
+        });
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateDrainJob(
     const CreateDrainJobRequest& request) {
     return master_service_.CreateDrainJob(request);
@@ -1839,6 +1897,18 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::NotifyPromotionFailure>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::PromotionObjectHeartbeatV2>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::PromotionAllocStartV2>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::NotifyPromotionSuccessV2>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::NotifyPromotionFailureV2>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CopyStart>(
         &wrapped_master_service);

@@ -329,3 +329,10 @@ foreach(
   ordered_oplog_writer_test)
   target_link_libraries(${target} PRIVATE Mooncake::xxhash)
 endforeach()
+
+add_store_test(disk_eviction_logging_test disk_eviction_logging_test.cpp)
+
+# Explicitly invoked against an isolated final-image master (not a unit test).
+add_executable(promotion_rpc_probe ../../phala/promotion/rpc-fencing-probe.cpp)
+target_link_libraries(promotion_rpc_probe PRIVATE mooncake_store transfer_engine
+  cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog::glog ibverbs pthread)
