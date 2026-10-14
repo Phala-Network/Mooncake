@@ -988,15 +988,19 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     -> tl::expected<void, ErrorCode> {
     {
         // Cleanup can hold the snapshot barrier while scanning every shard.
-        // Do not retain the client lock while waiting for that barrier: Ping
-        // needs it even for clients unrelated to this remount. Acquire both
-        // without blocking on one while holding the other, preserving the
-        // atomic client/segment publication below.
+        // This handler runs inline on its RPC connection's io thread. Do not
+        // wait for the barrier there: even without retaining the client lock,
+        // it would keep that thread from reading unrelated clients' Ping.
+        // Reject before changing state so the heartbeat loop can retry after
+        // cleanup, preserving the atomic client/segment publication below.
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_,
                                                        std::defer_lock);
         std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_,
                                                          std::defer_lock);
-        std::lock(client_lock, snapshot_lock);
+        if (std::try_lock(client_lock, snapshot_lock) != -1) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
         for (const auto& segment : segments) {
             if (!segment.host_id.empty()) {
                 client_host_id_[client_id] = segment.host_id;
@@ -11141,7 +11145,6 @@ void MasterService::ClientMonitorFunc() {
             std::vector<size_t> dec_capacities;
             std::vector<UUID> client_ids;
             std::vector<std::string> segment_names;
-            std::unordered_set<UUID, boost::hash<UUID>> alive_clients;
             std::shared_lock<std::shared_mutex> snapshot_lock;
             {
                 std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
@@ -11155,8 +11158,6 @@ void MasterService::ClientMonitorFunc() {
                     }
                     client_host_id_.erase(client_id);
                 }
-                alive_clients = ok_client_;
-
                 ScopedSegmentAccess segment_access =
                     segment_manager_.getSegmentAccess();
                 for (auto& client_id : expired_clients) {
@@ -11187,7 +11188,19 @@ void MasterService::ClientMonitorFunc() {
             // Always clean up invalid handles when there are expired clients,
             // even if no memory segments were unmounted. This is necessary
             // to clean up local_disk replicas whose owner client has expired.
-            ClearInvalidHandles(alive_clients);
+            // A new disk owner can register while this shared snapshot
+            // barrier is held. Absence from an earlier alive-client snapshot
+            // does not make that owner's replicas stale. Retire only the disk
+            // owners that this monitor pass actually expired.
+            const std::unordered_set<UUID, boost::hash<UUID>> expired(
+                expired_clients.begin(), expired_clients.end());
+            ClearStaleHandles([&expired](const Replica& replica) {
+                const auto owner = replica.get_local_disk_client_id();
+                return replica.is_completed() &&
+                       (replica.has_invalid_mem_handle() ||
+                        replica.has_invalid_nof_handle() ||
+                        (owner && expired.contains(*owner)));
+            });
 
             // Commit unmount of memory segments and clean up local_disk
             // segments for expired clients. Both require the exclusive

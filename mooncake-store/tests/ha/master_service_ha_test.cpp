@@ -710,7 +710,7 @@ class MasterServiceHATest : public ::testing::Test {
         return std::unique_lock<std::shared_mutex>(service.snapshot_mutex_);
     }
 
-    static void ExpectPingWhileRemountWaitsForSnapshot(bool exclusive) {
+    static void ExpectRemountRetriesWhileSnapshotIsBusy(bool exclusive) {
         MasterService service(
             MasterServiceConfig::builder().set_enable_ha(false).build());
         const UUID healthy_client = generate_uuid();
@@ -733,8 +733,9 @@ class MasterServiceHATest : public ::testing::Test {
             return service.ReMountSegment({}, remount_client);
         });
         started_future.wait();
-        EXPECT_EQ(remount.wait_for(std::chrono::milliseconds(100)),
-                  std::future_status::timeout);
+        const bool remount_rejected =
+            remount.wait_for(std::chrono::seconds(1)) ==
+            std::future_status::ready;
 
         auto ping = std::async(std::launch::async, [&] {
             return std::make_pair(service.Ping(healthy_client),
@@ -743,13 +744,14 @@ class MasterServiceHATest : public ::testing::Test {
         const bool ping_completed =
             ping.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
         // Always release the barrier before assertions that can return, so
-        // the original convoy fails the test instead of hanging its futures.
+        // the blocking baseline fails instead of hanging its futures.
         if (exclusive) {
             writer.unlock();
         } else {
             reader.unlock();
         }
         EXPECT_TRUE(ping_completed);
+        EXPECT_TRUE(remount_rejected);
         ASSERT_EQ(ping.wait_for(std::chrono::seconds(5)),
                   std::future_status::ready);
         const auto responses = ping.get();
@@ -762,7 +764,13 @@ class MasterServiceHATest : public ::testing::Test {
         }
         ASSERT_EQ(remount.wait_for(std::chrono::seconds(5)),
                   std::future_status::ready);
-        EXPECT_TRUE(remount.get().has_value());
+        const auto rejected = remount.get();
+        EXPECT_FALSE(rejected.has_value());
+        if (!rejected.has_value()) {
+            EXPECT_EQ(rejected.error(),
+                      ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        EXPECT_TRUE(service.ReMountSegment({}, remount_client).has_value());
         const auto recovered = service.Ping(remount_client);
         ASSERT_TRUE(recovered.has_value());
         EXPECT_EQ(recovered->client_status, ClientStatus::OK);
@@ -800,6 +808,42 @@ class MasterServiceHATest : public ::testing::Test {
     static std::unique_lock<std::shared_mutex> LockClientForTesting(
         MasterService& service) {
         return std::unique_lock<std::shared_mutex>(service.client_mutex_);
+    }
+
+    static bool WaitForClientExpiryForTesting(MasterService& service,
+                                              const UUID& client_id) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            {
+                std::shared_lock<std::shared_mutex> lock(service.client_mutex_);
+                if (!service.ok_client_.contains(client_id)) {
+                    return true;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return false;
+    }
+
+    static std::unique_lock<SharedMutex> LockFirstMetadataShardForTesting(
+        MasterService& service) {
+        return std::unique_lock<SharedMutex>(service.metadata_shards_[0].mutex);
+    }
+
+    static bool HasMountedLocalDiskSegmentForTesting(MasterService& service,
+                                                     const UUID& client_id) {
+        return service.HasMountedLocalDiskSegment(client_id);
+    }
+
+    static std::string KeyAfterFirstShardForTesting(MasterService& service) {
+        for (size_t index = 0; index < MasterService::kNumShards * 2; ++index) {
+            const auto key = "new_disk_owner_" + std::to_string(index);
+            if (service.getMetadataShardIndex(kDefaultTenant, key) != 0) {
+                return key;
+            }
+        }
+        return {};
     }
 
     static size_t SegmentAllocatedSizeForTesting(MasterService& service,
@@ -1344,12 +1388,93 @@ TEST_F(MasterServiceHATest,
     EXPECT_TRUE(completed_while_client_locked);
 }
 
-TEST_F(MasterServiceHATest, PingContinuesWhileRemountWaitsForCleanupBarrier) {
-    ExpectPingWhileRemountWaitsForSnapshot(/*exclusive=*/false);
+TEST_F(MasterServiceHATest, RemountRetriesWhileCleanupBarrierIsBusy) {
+    ExpectRemountRetriesWhileSnapshotIsBusy(/*exclusive=*/false);
 }
 
-TEST_F(MasterServiceHATest, PingContinuesWhileRemountWaitsForSnapshotWriter) {
-    ExpectPingWhileRemountWaitsForSnapshot(/*exclusive=*/true);
+TEST_F(MasterServiceHATest, RemountRetriesWhileSnapshotWriterIsBusy) {
+    ExpectRemountRetriesWhileSnapshotIsBusy(/*exclusive=*/true);
+}
+
+TEST_F(MasterServiceHATest, RemountRetriesWhileClientStateIsBusy) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    const UUID client_id = generate_uuid();
+    auto client_lock = LockClientForTesting(service);
+    auto remount = std::async(std::launch::async, [&] {
+        return service.ReMountSegment({}, client_id);
+    });
+    const bool rejected_before_unlock =
+        remount.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    client_lock.unlock();
+    EXPECT_TRUE(rejected_before_unlock);
+    ASSERT_EQ(remount.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    const auto rejected = remount.get();
+    EXPECT_FALSE(rejected.has_value());
+    if (!rejected.has_value()) {
+        EXPECT_EQ(rejected.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    const auto before_retry = service.Ping(client_id);
+    ASSERT_TRUE(before_retry.has_value());
+    EXPECT_EQ(before_retry->client_status, ClientStatus::NEED_REMOUNT);
+    ASSERT_TRUE(service.ReMountSegment({}, client_id).has_value());
+    const auto recovered = service.Ping(client_id);
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ(recovered->client_status, ClientStatus::OK);
+}
+
+TEST_F(MasterServiceHATest,
+       ExpiryCleanupPreservesDiskOwnerMountedAfterSnapshot) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_enable_offload(true)
+                              .set_client_live_ttl_sec(1)
+                              .build());
+    const UUID expired_owner = generate_uuid();
+    const UUID new_owner = generate_uuid();
+    ASSERT_TRUE(service.ReMountSegment({}, expired_owner).has_value());
+    ASSERT_TRUE(
+        service.MountLocalDiskSegment(expired_owner, false).has_value());
+    const auto key = KeyAfterFirstShardForTesting(service);
+    ASSERT_FALSE(key.empty());
+    const OffloadTaskItem expired_task{std::string(kDefaultTenant.value()),
+                                       "expired_disk_owner_key", 128};
+    StorageObjectMetadata metadata{};
+    metadata.data_size = 128;
+    metadata.transport_endpoint = "expired:50052";
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(expired_owner, {expired_task}, {metadata})
+            .has_value());
+
+    auto first_shard = LockFirstMetadataShardForTesting(service);
+    const bool expired = WaitForClientExpiryForTesting(service, expired_owner);
+    // The monitor has captured its client set and now waits on shard zero.
+    // Disk registration uses a shared snapshot lock, so it is admitted while
+    // cleanup is paused; the new owner was absent from that captured set.
+    const auto mounted = service.MountLocalDiskSegment(new_owner, false);
+    const OffloadTaskItem new_task{std::string(kDefaultTenant.value()), key,
+                                   128};
+    metadata.transport_endpoint = "new:50052";
+    const auto registered =
+        service.NotifyOffloadSuccess(new_owner, {new_task}, {metadata});
+    first_shard.unlock();
+    ASSERT_TRUE(expired);
+    ASSERT_TRUE(mounted.has_value());
+    ASSERT_TRUE(registered.has_value());
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (HasMountedLocalDiskSegmentForTesting(service, expired_owner) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_FALSE(HasMountedLocalDiskSegmentForTesting(service, expired_owner));
+    const auto surviving = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(surviving.has_value());
+    const auto retired = service.ExistKey(expired_task.key, kDefaultTenant);
+    ASSERT_TRUE(retired.has_value());
+    EXPECT_FALSE(*retired);
 }
 
 TEST_F(MasterServiceHATest, NoFBatchEvictWaitsForSnapshotBarrier) {
