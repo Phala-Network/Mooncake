@@ -91,6 +91,7 @@ class DynamicReplicationTest;
 class MasterServiceTenantQuotaTest;
 class MasterScenario;
 class MasterServiceHATest;
+class RemountRpcRetryTest;
 // Friended so the processing_keys double-erase reproduction test can
 // invalidate a segment allocator via PrepareUnmountSegment WITHOUT the
 // ClearInvalidHandles sweep that MasterService::UnmountSegment performs.
@@ -136,8 +137,9 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  * 7. soft_pin_deadline_index_ mutex
  *
  * ReMountSegment acquires client_mutex_ and snapshot_mutex_ together with
- * std::lock. Its retry protocol never blocks on either while retaining the
- * other, so it does not invert the blocking acquisition order above.
+ * std::try_lock. If either is busy it returns a retryable status without
+ * changing state or blocking an RPC io thread, so it does not invert the
+ * blocking acquisition order above.
  *
  * Strict tenant admission and policy mutation paths that need both
  * tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
@@ -167,6 +169,7 @@ class MasterService {
                                            // members
     friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
     friend class test::MasterServiceHATest;
+    friend class test::RemountRpcRetryTest;
 
    public:
     using NoFProbeFn =

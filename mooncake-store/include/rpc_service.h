@@ -348,6 +348,7 @@ class WrappedMasterService {
     KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
+    friend class test::RemountRpcRetryTest;
     MasterService master_service_;
 };
 
