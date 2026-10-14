@@ -987,15 +987,19 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     -> tl::expected<void, ErrorCode> {
     {
         // Cleanup can hold the snapshot barrier while scanning every shard.
-        // Do not retain the client lock while waiting for that barrier: Ping
-        // needs it even for clients unrelated to this remount. Acquire both
-        // without blocking on one while holding the other, preserving the
-        // atomic client/segment publication below.
+        // This handler runs inline on its RPC connection's io thread. Do not
+        // wait for the barrier there: even without retaining the client lock,
+        // it would keep that thread from reading unrelated clients' Ping.
+        // Reject before changing state so the heartbeat loop can retry after
+        // cleanup, preserving the atomic client/segment publication below.
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_,
                                                         std::defer_lock);
         std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_,
                                                           std::defer_lock);
-        std::lock(client_lock, snapshot_lock);
+        if (std::try_lock(client_lock, snapshot_lock) != -1) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
         for (const auto& segment : segments) {
             if (!segment.host_id.empty()) {
                 client_host_id_[client_id] = segment.host_id;
