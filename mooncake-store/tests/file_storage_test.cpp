@@ -26,6 +26,27 @@ void UnsetEnv(const std::string& key) { unsetenv(key.c_str()); }
 
 class FileStorageTest : public ::testing::Test {
    protected:
+    void InjectUnmount(FileStorage& storage,
+                       std::function<tl::expected<void, ErrorCode>()> fn) {
+        storage.test_unmount_local_disk_ = std::move(fn);
+    }
+
+    bool IsDraining(FileStorage& storage) { return storage.draining_.load(); }
+
+    auto NotifyRecovery(FileStorage& storage,
+                        const std::vector<std::string>& keys,
+                        const std::vector<StorageObjectMetadata>& metadata) {
+        return storage.NotifyRecoveredObjects(keys, metadata);
+    }
+
+    void InjectRecoveryNotify(FileStorage& storage,
+                              std::function<tl::expected<void, ErrorCode>(
+                                  const std::vector<OffloadTaskItem>&,
+                                  const std::vector<StorageObjectMetadata>&)>
+                                  fn) {
+        storage.test_recovery_notify_ = std::move(fn);
+    }
+
     std::string data_path;
     void SetUp() override {
         google::InitGoogleLogging("FileStorageTest");
@@ -868,6 +889,122 @@ TEST_F(FileStorageTest, NullSsdMetricDoesNotCrash) {
         FileStorageBatchLoad(fileStorage, allocate_res.value()->slices);
     ASSERT_TRUE(load_result);
     // No crash = success. No metrics pointer, so nothing to verify.
+}
+
+TEST_F(FileStorageTest, DrainTimeoutKeepsLatchAndRetriesWithoutRemount) {
+    fs::create_directories(data_path + "/drain_retry_master");
+    testing::InProcMaster master;
+    auto master_config = InProcMasterConfigBuilder()
+                             .set_enable_offload(true)
+                             .set_root_fs_dir(data_path + "/drain_retry_master")
+                             .build();
+    ASSERT_TRUE(master.Start(master_config));
+    const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client);
+    ASSERT_TRUE(client.value()->MountLocalDiskSegment(true));
+    FileStorageConfig config;
+    config.storage_filepath = data_path + "/drain_retry";
+    config.local_buffer_size = 4 * 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage storage(config, client.value(), endpoint);
+    int attempts = 0;
+    InjectUnmount(storage, [&]() -> tl::expected<void, ErrorCode> {
+        ++attempts;
+        auto applied = client.value()->UnmountLocalDiskSegment();
+        EXPECT_TRUE(applied);
+        if (attempts == 1) {
+            // The server completed the request but the reply was lost.
+            return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+        }
+        return applied;
+    });
+    auto first = storage.DrainLocalDiskSegment(0);
+    ASSERT_FALSE(first);
+    EXPECT_EQ(first.error(), ErrorCode::RPC_TIMEOUT);
+    ASSERT_TRUE(IsDraining(storage));
+    ASSERT_TRUE(FileStorageHeartbeat(storage));
+    EXPECT_EQ(attempts, 2);
+    ASSERT_TRUE(FileStorageHeartbeat(storage));
+    EXPECT_EQ(attempts, 2);
+    std::vector<OffloadTaskItem> tasks;
+    auto offload = client.value()->OffloadObjectHeartbeat(true, tasks);
+    ASSERT_FALSE(offload);
+    EXPECT_EQ(offload.error(), ErrorCode::SEGMENT_NOT_FOUND);
+}
+
+TEST_F(FileStorageTest, RecoveryNotificationsSplitLegacyBatchWithoutSkipping) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 4 * 1024 * 1024;
+    FileStorage storage(config, nullptr, "127.0.0.1:19001");
+    std::vector<std::string> keys;
+    std::vector<StorageObjectMetadata> metadata(20000);
+    for (size_t i = 0; i < metadata.size(); ++i) {
+        keys.push_back("synthetic_" + std::to_string(i));
+        metadata[i].data_size = i + 1;
+    }
+    size_t count = 0, calls = 0;
+    InjectRecoveryNotify(
+        storage,
+        [&](const auto& tasks,
+            const auto& metas) -> tl::expected<void, ErrorCode> {
+            ++calls;
+            EXPECT_LE(tasks.size(), 512u);
+            EXPECT_EQ(tasks.size(), metas.size());
+            for (size_t i = 0; i < tasks.size(); ++i, ++count) {
+                EXPECT_EQ(tasks[i].key, keys[count]);
+                EXPECT_EQ(metas[i].data_size, count + 1);
+            }
+            return {};
+        });
+    ASSERT_TRUE(NotifyRecovery(storage, keys, metadata));
+    EXPECT_EQ(count, 20000u);
+    EXPECT_EQ(calls, 40u);
+}
+
+TEST_F(FileStorageTest, RecoveryNotificationAmbiguousFailureIsNotRetried) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 4 * 1024 * 1024;
+    FileStorage storage(config, nullptr, "127.0.0.1:19001");
+    const std::vector<std::string> keys(1025, "synthetic");
+    const std::vector<StorageObjectMetadata> metadata(keys.size());
+    int calls = 0;
+    InjectRecoveryNotify(
+        storage,
+        [&](const auto&, const auto&) -> tl::expected<void, ErrorCode> {
+            if (++calls == 2)
+                return tl::make_unexpected(ErrorCode::RPC_TIMEOUT);
+            return {};
+        });
+    const auto result = NotifyRecovery(storage, keys, metadata);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::RPC_TIMEOUT);
+    EXPECT_EQ(calls, 2);
+    EXPECT_FALSE(NotifyRecovery(storage, {"mismatched"}, {}));
+    EXPECT_EQ(calls, 2);
+}
+
+TEST_F(FileStorageTest, RecoveryNotificationKeepsOversizedLegacyKey) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 4 * 1024 * 1024;
+    FileStorage storage(config, nullptr, "127.0.0.1:19001");
+    const std::vector<std::string> keys = {std::string(300 * 1024, 'x'),
+                                           "next"};
+    const std::vector<StorageObjectMetadata> metadata(keys.size());
+    size_t count = 0;
+    InjectRecoveryNotify(
+        storage,
+        [&](const auto& tasks, const auto&) -> tl::expected<void, ErrorCode> {
+            EXPECT_EQ(tasks.size(), 1u);
+            EXPECT_EQ(tasks.front().key, keys[count++]);
+            return {};
+        });
+    EXPECT_TRUE(NotifyRecovery(storage, keys, metadata));
+    EXPECT_EQ(count, 2u);
 }
 
 }  // namespace mooncake

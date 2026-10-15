@@ -38,8 +38,8 @@ class FileStorage {
      * holds across its master RPCs, so a tick that read the latch before it
      * was set cannot resume after the deregistration and re-mount: it either
      * finished before the drain latched, or it re-checks the latch when it
-     * acquires the lock. The latch is not reversible on success; the process
-     * is expected to exit.
+     * acquires the lock. A failed unmount keeps the latch set; heartbeats retry
+     * the unmount without re-mounting. The process is expected to exit.
      */
     tl::expected<void, ErrorCode> DrainLocalDiskSegment(
         uint64_t grace_period_ms);
@@ -197,6 +197,20 @@ class FileStorage {
      * This is the same logic as the ScanMeta step in Init().
      */
     tl::expected<void, ErrorCode> ReRegisterOffloadedObjects();
+    tl::expected<void, ErrorCode> NotifyRecoveredObjects(
+        const std::vector<std::string>& keys,
+        const std::vector<StorageObjectMetadata>& metadatas);
+    std::function<tl::expected<void, ErrorCode>(
+        const std::vector<OffloadTaskItem>&,
+        const std::vector<StorageObjectMetadata>&)>
+        test_recovery_notify_;
+
+    // Caller holds offloading_mutex_. An ambiguous RPC failure must not reopen
+    // the disk tier while the master may already be sweeping its replicas.
+    tl::expected<void, ErrorCode> UnmountDrainingDiskLocked();
+    bool GUARDED_BY(offloading_mutex_) local_disk_unmounted_{false};
+    // Private deterministic transport seam used by FileStorageTest.
+    std::function<tl::expected<void, ErrorCode>()> test_unmount_local_disk_;
 
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};

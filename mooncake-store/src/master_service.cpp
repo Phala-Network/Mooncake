@@ -9059,6 +9059,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
     MetadataShardAccessorRW& shard,
     const std::chrono::system_clock::time_point& now) {
     std::list<DiscardedReplicas> discarded_replicas;
+    size_t expired_offload_tasks = 0;
 
     for (auto tenant_it = shard->tenants.begin();
          tenant_it != shard->tenants.end();) {
@@ -9320,8 +9321,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     source->dec_refcnt();
                 }
             }
-            LOG(WARNING) << "Offloading task expired for key: "
-                         << task_it->first << " tenant=" << tenant_it->first;
+            ++expired_offload_tasks;
             task_it = tenant_state.offloading_tasks.erase(task_it);
         }
 
@@ -9367,6 +9367,12 @@ void MasterService::DiscardExpiredProcessingReplicas(
         }
     }
 
+    // At most one content-free summary per shard pass, rather than an I/O
+    // operation for every expired key while the shard write lock is held.
+    if (expired_offload_tasks != 0) {
+        LOG(WARNING) << "action=offload_tasks_expired, count="
+                     << expired_offload_tasks;
+    }
     if (!discarded_replicas.empty()) {
         std::lock_guard lock(discarded_replicas_mutex_);
         discarded_replicas_.splice(discarded_replicas_.end(),

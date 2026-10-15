@@ -28,6 +28,42 @@ class MasterServiceSSDTest : public ::testing::Test {
     }
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
+
+    void QueueNewOffloadTask(MasterService& service, const UUID& owner,
+                             const std::string& key) {
+        MasterService::MetadataAccessorRW access(
+            &service, MasterService::ObjectIdentity{TenantId::Default(), key});
+        ASSERT_TRUE(access.Exists());
+        auto* source = access.Get().GetFirstReplica(
+            [](const Replica& r) { return r.is_memory_replica(); });
+        ASSERT_NE(source, nullptr);
+        ASSERT_TRUE(access.GetTenantState().offloading_tasks.empty());
+        source->inc_refcnt();
+        access.GetTenantState().offloading_tasks.emplace(
+            key, MasterService::OffloadingTask{
+                     source->id(), std::chrono::system_clock::now(), {owner}});
+    }
+
+    bool HasOffloadTask(MasterService& service, const std::string& key) {
+        MasterService::MetadataAccessorRW access(
+            &service, MasterService::ObjectIdentity{TenantId::Default(), key});
+        return access.Exists() &&
+               access.GetTenantState().offloading_tasks.count(key) != 0;
+    }
+
+    void ExpireSyntheticOffloadTasks(MasterService& service, size_t count) {
+        MasterService::MetadataShardAccessorRW shard(&service, 0);
+        auto& tenant = shard->tenants[TenantId::Default()];
+        for (size_t i = 0; i < count; ++i) {
+            tenant.offloading_tasks.emplace(
+                "synthetic_expired_" + std::to_string(i),
+                MasterService::OffloadingTask{
+                    0, std::chrono::system_clock::time_point{}, {}});
+        }
+        service.DiscardExpiredProcessingReplicas(
+            shard, std::chrono::system_clock::now());
+        EXPECT_EQ(shard->tenants.count(TenantId::Default()), 0u);
+    }
 };
 
 std::unique_ptr<MasterService> CreateSsdAwareOffloadService() {
@@ -1181,6 +1217,40 @@ TEST_F(LocalDiskUnmountInterleavingTest,
     ASSERT_TRUE(late_replicas.has_value());
     ASSERT_EQ(1u, late_replicas.value().replicas.size());
     EXPECT_TRUE(late_replicas.value().replicas[0].is_local_disk_replica());
+}
+
+TEST_F(MasterServiceSSDTest, ExpiredOffloadTaskLoggingIsBounded) {
+    auto service = CreateSsdAwareOffloadService();
+    ::testing::internal::CaptureStderr();
+    ExpireSyntheticOffloadTasks(*service, 100000);
+    const auto log = ::testing::internal::GetCapturedStderr();
+    EXPECT_NE(log.find("action=offload_tasks_expired, count=100000"),
+              std::string::npos);
+    EXPECT_EQ(log.find("synthetic_expired_"), std::string::npos);
+    EXPECT_LT(log.size(), 4096u);
+}
+
+// Diagnostic, explicitly enabled by the isolated recovery review runner.
+// This pins the unsafe premise of retrying the existing completion RPC.
+TEST_F(MasterServiceSSDTest,
+       DISABLED_RecoveryNotifyReplayMustNotSettleNewTask) {
+    auto service = CreateSsdAwareOffloadService();
+    const auto owner = generate_uuid();
+    MountMemoryAndLocalDisk(*service, owner, "recovery_replay", 0x1500000000);
+    const std::string key = "synthetic_recovery_replay";
+    PutAndOffload(*service, owner, key, 128, "127.0.0.1:19001");
+    ASSERT_FALSE(HasOffloadTask(*service, key));
+    // Initial recovery notification was applied, but its reply was lost.
+    // Before the owner retries, the same owner gets a NEW task for this key.
+    QueueNewOffloadTask(*service, owner, key);
+    ASSERT_TRUE(HasOffloadTask(*service, key));
+    StorageObjectMetadata metadata;
+    metadata.data_size = 128;
+    metadata.transport_endpoint = "127.0.0.1:19001";
+    OffloadTaskItem task{
+        .tenant_id = TenantId::Default().value(), .key = key, .size = 128};
+    ASSERT_TRUE(service->NotifyOffloadSuccess(owner, {task}, {metadata}));
+    EXPECT_TRUE(HasOffloadTask(*service, key));
 }
 
 }  // namespace mooncake::test

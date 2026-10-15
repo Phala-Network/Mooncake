@@ -190,9 +190,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
             for (auto& metadata : metadatas) {
                 metadata.transport_endpoint = local_rpc_addr_;
             }
-            auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
-            auto add_object_result =
-                client_->NotifyOffloadSuccess(tasks, metadatas);
+            auto add_object_result = NotifyRecoveredObjects(keys, metadatas);
             if (!add_object_result) {
                 LOG(ERROR) << "Failed to add object to master: "
                            << add_object_result.error();
@@ -656,7 +654,8 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     // Ping on the storage heartbeat thread, not here, so the client stays
     // alive for its memory segments.
     if (draining_.load()) {
-        return {};
+        MutexLocker locker(&offloading_mutex_);
+        return UnmountDrainingDiskLocked();
     }
 
     // Join previous rescan if completed
@@ -691,7 +690,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         // on would hit SEGMENT_NOT_FOUND below and re-mount the segment the
         // drain just deregistered.
         if (draining_.load()) {
-            return {};
+            return UnmountDrainingDiskLocked();
         }
         auto fetch_offload_tasks = [&]() -> tl::expected<void, ErrorCode> {
             return client_->OffloadObjectHeartbeat(enable_offloading_,
@@ -832,11 +831,10 @@ tl::expected<void, ErrorCode> FileStorage::DrainLocalDiskSegment(
         MutexLocker locker(&offloading_mutex_);
         draining_.store(true);
 
-        auto result = client_->UnmountLocalDiskSegment();
+        auto result = UnmountDrainingDiskLocked();
         if (!result) {
             LOG(ERROR) << "action=drain_local_disk_segment, error="
                        << result.error();
-            draining_.store(false);
             return result;
         }
     }
@@ -847,6 +845,16 @@ tl::expected<void, ErrorCode> FileStorage::DrainLocalDiskSegment(
         std::this_thread::sleep_for(std::chrono::milliseconds(grace_period_ms));
     }
     return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::UnmountDrainingDiskLocked() {
+    if (local_disk_unmounted_) {
+        return {};
+    }
+    auto result = test_unmount_local_disk_ ? test_unmount_local_disk_()
+                                           : client_->UnmountLocalDiskSegment();
+    local_disk_unmounted_ = result.has_value();
+    return result;
 }
 
 tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
@@ -1189,6 +1197,54 @@ bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
     return false;
 }
 
+tl::expected<void, ErrorCode> FileStorage::NotifyRecoveredObjects(
+    const std::vector<std::string>& keys,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    if (keys.size() != metadatas.size()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // Split notifications, not the backend iterator: legacy buckets can be
+    // larger than this RPC budget and must remain recoverable.
+    constexpr size_t kMaxKeys = 512;
+    constexpr size_t kMaxBytes = 256 * 1024;
+    const auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
+    for (size_t begin = 0; begin < tasks.size();) {
+        if (draining_.load()) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        size_t end = begin;
+        size_t bytes = 0;
+        while (end < tasks.size() && end - begin < kMaxKeys) {
+            const size_t cost = tasks[end].key.size() +
+                                tasks[end].tenant_id.size() +
+                                metadatas[end].transport_endpoint.size() + 128;
+            // A legal legacy key may itself exceed the target. Send it alone
+            // rather than silently dropping it or changing the disk format.
+            if (end != begin &&
+                (cost > kMaxBytes || bytes > kMaxBytes - cost)) {
+                break;
+            }
+            bytes += cost;
+            ++end;
+        }
+        const std::vector<OffloadTaskItem> part(tasks.begin() + begin,
+                                                tasks.begin() + end);
+        const std::vector<StorageObjectMetadata> metadata_part(
+            metadatas.begin() + begin, metadatas.begin() + end);
+        auto result = test_recovery_notify_
+                          ? test_recovery_notify_(part, metadata_part)
+                          : client_->NotifyOffloadSuccess(part, metadata_part);
+        // The legacy RPC also settles tasks and has no generation token.
+        // An ambiguous timeout is NOT safe to retry here: it could settle a
+        // newer task. Fail explicitly until a recovery-only RPC is negotiated.
+        if (!result) {
+            return result;
+        }
+        begin = end;
+    }
+    return {};
+}
+
 tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
     LOG(INFO) << "ReRegisterOffloadedObjects: starting ScanMeta to re-register "
               << "offloaded objects with master";
@@ -1223,9 +1279,8 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
                 for (auto& metadata : metadatas) {
                     metadata.transport_endpoint = local_rpc_addr_;
                 }
-                auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
                 auto add_object_result =
-                    client_->NotifyOffloadSuccess(tasks, metadatas);
+                    NotifyRecoveredObjects(keys, metadatas);
                 if (!add_object_result) {
                     total_failures++;
                     LOG(ERROR)

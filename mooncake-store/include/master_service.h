@@ -89,6 +89,7 @@ class SnapshotChildProcessTest;
 class PromotionOnHitTest;
 class DynamicReplicationTest;
 class MasterServiceTenantQuotaTest;
+class MasterServiceSSDTest;
 class MasterScenario;
 class MasterServiceHATest;
 // Friended so the processing_keys double-erase reproduction test can
@@ -155,6 +156,7 @@ class MasterService {
     friend class test::DynamicReplicationTest;
     friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
+    friend class test::MasterServiceSSDTest;
     // The scenario DSL controls lease timestamps so eviction tests do not
     // depend on sleeps or the background eviction thread.
     friend class test::MasterScenario;
