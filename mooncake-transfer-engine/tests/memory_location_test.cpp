@@ -6,6 +6,162 @@
 #include <numaif.h>
 #include <sys/mman.h>
 
+#include <limits>
+
+namespace {
+
+void checkRegistrationPlanLabel(uint64_t start, size_t length, size_t limit,
+                               const std::string &label) {
+    mooncake::SegmentsLocationInfo original;
+    ASSERT_TRUE(mooncake::parseSegmentsLocation(label, original));
+    const auto chunks =
+        mooncake::planMemoryRegistration(start, length, label, limit);
+    ASSERT_FALSE(chunks.empty());
+    size_t covered = 0;
+    for (const auto &chunk : chunks) {
+        ASSERT_EQ(chunk.start, start + covered);
+        ASSERT_GT(chunk.len, 0u);
+        if (limit > 0) ASSERT_LE(chunk.len, limit);
+        // The old consumer already accepts cpu:N. Compare against the old
+        // resolver using ORIGINAL coordinates, including every synthetic byte.
+        for (size_t offset = 0; offset < chunk.len; ++offset)
+            ASSERT_EQ(chunk.location,
+                      mooncake::resolveSegmentsLocation(original, length,
+                                                        covered + offset));
+        covered += chunk.len;
+    }
+    ASSERT_EQ(covered, length);
+}
+
+void checkRegistrationPlan(uint64_t start, size_t length, size_t limit,
+                           const std::vector<int> &nodes) {
+    checkRegistrationPlanLabel(
+        start, length, limit, mooncake::buildSegmentsLocation(4096, nodes));
+}
+
+}  // namespace
+
+TEST(MemoryRegistrationTest, Original64KiBReproduction) {
+    const auto chunks = mooncake::planMemoryRegistration(
+        0x100000, 65536, "segments:4096:0,1,2,3", 16384);
+    ASSERT_EQ(chunks.size(), 4u);
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        EXPECT_EQ(chunks[i].start, 0x100000u + i * 16384);
+        EXPECT_EQ(chunks[i].len, 16384u);
+        EXPECT_EQ(chunks[i].location, "cpu:" + std::to_string(i));
+    }
+    checkRegistrationPlan(0x100000, 65536, 16384, {0, 1, 2, 3});
+}
+
+TEST(MemoryRegistrationTest, SplitAtRegionEvenWithoutMrLimit) {
+    const auto chunks = mooncake::planMemoryRegistration(
+        0x100000, 65536, "segments:4096:0,1,2,3", 0);
+    ASSERT_EQ(chunks.size(), 4u);
+    checkRegistrationPlan(0x100000, 65536, 0, {0, 1, 2, 3});
+}
+
+TEST(MemoryRegistrationTest, MrLimitCrossesRegionBoundary) {
+    const auto chunks = mooncake::planMemoryRegistration(
+        0x100000, 65536, "segments:4096:0,1,2,3", 24576);
+    ASSERT_EQ(chunks.size(), 4u);
+    for (const auto &chunk : chunks) EXPECT_EQ(chunk.len, 16384u);
+    checkRegistrationPlan(0x100000, 65536, 24576, {0, 1, 2, 3});
+}
+
+TEST(MemoryRegistrationTest, MrLimitDoesNotDivideRegion) {
+    const auto chunks = mooncake::planMemoryRegistration(
+        0x100000, 65536, "segments:4096:0,1,2,3", 12288);
+    ASSERT_EQ(chunks.size(), 8u);
+    for (size_t i = 0; i < chunks.size(); ++i)
+        EXPECT_EQ(chunks[i].len, i % 2 == 0 ? 12288u : 4096u);
+    checkRegistrationPlan(0x100000, 65536, 12288, {0, 1, 2, 3});
+}
+
+TEST(MemoryRegistrationTest, TailUsesOriginalFloorAndClamp) {
+    const auto chunks = mooncake::planMemoryRegistration(
+        0x100003, 73, "segments:65536:1,3,5,7", 0);
+    ASSERT_EQ(chunks.size(), 4u);
+    EXPECT_EQ(chunks[0].len, 18u);
+    EXPECT_EQ(chunks[1].len, 18u);
+    EXPECT_EQ(chunks[2].len, 18u);
+    EXPECT_EQ(chunks[3].len, 19u);
+    checkRegistrationPlan(0x100003, 73, 7, {1, 3, 5, 7});
+}
+
+TEST(MemoryRegistrationTest, CurrentOnePointFiveTiBHas96Mrs) {
+    constexpr size_t gib = 1ull << 30;
+    const auto chunks = mooncake::planMemoryRegistration(
+        0x100000, 1536 * gib, "segments:4096:0,1,2,3", 16 * gib);
+    ASSERT_EQ(chunks.size(), 96u);
+    for (size_t i = 0; i < chunks.size(); ++i) {
+        EXPECT_EQ(chunks[i].start, 0x100000u + i * 16 * gib);
+        EXPECT_EQ(chunks[i].len, 16 * gib);
+        EXPECT_EQ(chunks[i].location, "cpu:" + std::to_string(i / 24));
+    }
+}
+
+TEST(MemoryRegistrationTest, PreviousOnePointSevenFiveTiBHas112Mrs) {
+    constexpr size_t gib = 1ull << 30;
+    const auto chunks = mooncake::planMemoryRegistration(
+        0x100000, 1792 * gib, "segments:4096:0,1,2,3", 16 * gib);
+    ASSERT_EQ(chunks.size(), 112u);
+    for (size_t i = 0; i < chunks.size(); ++i)
+        EXPECT_EQ(chunks[i].location, "cpu:" + std::to_string(i / 28));
+}
+
+TEST(MemoryRegistrationTest, DirectAndWildcardNamesArePreserved) {
+    for (const auto &name : {"cpu:3", "cuda:1", "*", "custom-location"}) {
+        const auto chunks =
+            mooncake::planMemoryRegistration(0x100000, 33, name, 10);
+        ASSERT_EQ(chunks.size(), 4u);
+        EXPECT_EQ(chunks.back().len, 3u);
+        for (const auto &chunk : chunks) EXPECT_EQ(chunk.location, name);
+    }
+}
+
+TEST(MemoryRegistrationTest, RejectInvalidSegmentsBeforeRegistration) {
+    for (const auto &name : {"segments:", "segments:4096:",
+                             "segments:0:0,1", "segments:4096:-1,2",
+                             "segments:4096:not-a-node",
+                             "segments:18446744073709551616:0,1",
+                             "segments:4096:0,2147483648"})
+        EXPECT_TRUE(mooncake::planMemoryRegistration(0x100000, 64, name, 16)
+                        .empty());
+    EXPECT_TRUE(mooncake::planMemoryRegistration(
+                    0x100000, 2, "segments:4096:0,1,2", 16)
+                    .empty());
+}
+
+TEST(MemoryRegistrationTest, LegacyParserTolerantLabelsKeepOriginalCoordinates) {
+    // Preserve the old parser's tolerated numeric prefixes/empty tokens. The
+    // fix concerns registration coordinates, not tightening the wire grammar.
+    for (const auto &name : {"segments:4096:0,,2", "segments:4096:1x,3",
+                             "segments:-1:0,1", "segments:4096:,0,1",
+                             "segments:4096:0,1,", "segments:4096x:0,1",
+                             "segments: 4096:0,1", "segments:4096:0,+1",
+                             "segments:4096:0, 1", "segments:0001:03,03"})
+        for (size_t limit : {0u, 7u, 16u, 128u})
+            checkRegistrationPlanLabel(0x100003, 73, limit, name);
+}
+
+TEST(MemoryRegistrationTest, RejectEmptyOrOverflowingAddressRange) {
+    EXPECT_TRUE(
+        mooncake::planMemoryRegistration(0x100000, 0, "cpu:0", 16).empty());
+    EXPECT_TRUE(mooncake::planMemoryRegistration(
+                    std::numeric_limits<uint64_t>::max() - 3, 4, "cpu:0", 16)
+                    .empty());
+}
+
+TEST(MemoryRegistrationTest, ExhaustiveSmallBuffersAgreeWithOldResolver) {
+    for (size_t count = 1; count <= 5; ++count) {
+        std::vector<int> nodes;
+        for (size_t i = 0; i < count; ++i) nodes.push_back(2 * i + 1);
+        for (size_t length = count; length < 128; ++length)
+            for (size_t limit : {0u, 1u, 3u, 7u, 128u})
+                checkRegistrationPlan(0x100003, length, limit, nodes);
+    }
+}
+
 TEST(MemoryLocationTest, MallocSimpleNode0) {
     int size = 4096 * 10;
     void *addr = numa_alloc_onnode(size, 0);

@@ -14,6 +14,9 @@
 
 #include "memory_location.h"
 
+#include <algorithm>
+#include <limits>
+
 #include "cuda_alike.h"
 
 namespace mooncake {
@@ -175,6 +178,46 @@ std::string resolveSegmentsLocation(const SegmentsLocationInfo &info,
     size_t idx = offset / region_size;
     if (idx >= n) idx = n - 1;  // clamp for tail bytes
     return "cpu:" + std::to_string(info.numa_nodes[idx]);
+}
+
+std::vector<MemoryLocationEntry> planMemoryRegistration(
+    uint64_t start, size_t length, const std::string &location,
+    size_t max_mr_size) {
+    std::vector<MemoryLocationEntry> chunks;
+    if (length == 0 || length > std::numeric_limits<uint64_t>::max() - start)
+        return chunks;
+
+    SegmentsLocationInfo info;
+    const bool segmented = location.rfind(kSegmentsLocationPrefix, 0) == 0;
+    size_t region_size = 0;
+    if (segmented) {
+        if (!parseSegmentsLocation(location, info) || info.page_size == 0 ||
+            std::any_of(info.numa_nodes.begin(), info.numa_nodes.end(),
+                        [](int node) { return node < 0; }))
+            return chunks;
+        region_size = length / info.numa_nodes.size();
+        if (region_size == 0) return chunks;
+    }
+
+    for (size_t offset = 0; offset < length;) {
+        size_t chunk_length = length - offset;
+        if (max_mr_size > 0)
+            chunk_length = std::min(chunk_length, max_mr_size);
+        std::string chunk_location = location;
+        if (segmented) {
+            // Match the original resolver's floor division and final tail.
+            const size_t index =
+                std::min(offset / region_size, info.numa_nodes.size() - 1);
+            const size_t region_end = index == info.numa_nodes.size() - 1
+                                          ? length
+                                          : (index + 1) * region_size;
+            chunk_length = std::min(chunk_length, region_end - offset);
+            chunk_location = genCpuNodeName(info.numa_nodes[index]);
+        }
+        chunks.push_back({start + offset, chunk_length, chunk_location});
+        offset += chunk_length;
+    }
+    return chunks;
 }
 
 }  // namespace mooncake

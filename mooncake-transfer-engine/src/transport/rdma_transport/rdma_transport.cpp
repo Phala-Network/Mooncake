@@ -301,21 +301,6 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // and publish one BufferDesc per chunk (the per-context rkey/lkey lookups
     // are address-range based, so each chunk gets the correct key).
     size_t chunk_limit = (size_t)globalConfig().max_mr_size;
-    std::vector<std::pair<void *, size_t>> chunks;
-    if (chunk_limit > 0 && length > chunk_limit) {
-        for (size_t offset = 0; offset < length;) {
-            size_t chunk_len = std::min(chunk_limit, length - offset);
-            chunks.emplace_back(static_cast<char *>(addr) + offset, chunk_len);
-            offset += chunk_len;
-        }
-        LOG(WARNING) << "Auto-splitting buffer " << addr << " (" << length
-                     << " bytes) into " << chunks.size()
-                     << " chunks of <= " << chunk_limit
-                     << " bytes each (device max_mr_size; Mooncake#2017)";
-    } else {
-        chunks.emplace_back(addr, length);
-    }
-
     // Resolve the location name once, from the original buffer.
     std::string resolved_name;
     if (name == kWildcardLocation) {
@@ -326,6 +311,26 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         resolved_name = entries[0].location;
     } else {
         resolved_name = name;
+    }
+
+    // A segments label is relative to the original allocation. Reusing it
+    // with each shorter MR length changes its meaning for existing consumers.
+    // Keep every MR within one original NUMA region and publish cpu:N instead.
+    const auto chunk_plan = planMemoryRegistration(
+        reinterpret_cast<uint64_t>(addr), length, resolved_name, chunk_limit);
+    if (chunk_plan.empty()) {
+        LOG(ERROR) << "Invalid memory registration range or segments location";
+        return ERR_INVALID_ARGUMENT;
+    }
+    std::vector<std::pair<void *, size_t>> chunks;
+    chunks.reserve(chunk_plan.size());
+    for (const auto &chunk : chunk_plan)
+        chunks.emplace_back(reinterpret_cast<void *>(chunk.start), chunk.len);
+    if (chunks.size() > 1) {
+        LOG(WARNING) << "Auto-splitting buffer " << addr << " (" << length
+                     << " bytes) into " << chunks.size()
+                     << " chunks (device max_mr_size=" << chunk_limit
+                     << "; preserve original NUMA regions)";
     }
 
     // Export a single dma_buf fd for the whole buffer and import it into every
@@ -493,7 +498,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             if (remote_accessible)
                 buffer_desc.rkey.push_back(context->rkey(chunk_addr));
         }
-        buffer_desc.name = resolved_name;
+        buffer_desc.name = chunk_plan[ci].location;
         buffer_desc.addr = (uint64_t)chunk_addr;
         buffer_desc.length = chunk_len;
 #ifdef ENABLE_MULTI_PROTOCOL

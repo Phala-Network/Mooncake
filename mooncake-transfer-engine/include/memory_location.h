@@ -71,6 +71,15 @@ bool parseSegmentsLocation(const std::string &name, SegmentsLocationInfo &info);
 std::string resolveSegmentsLocation(const SegmentsLocationInfo &info,
                                     uint64_t buffer_length, uint64_t offset);
 
+// Plan MR descriptors without changing the location coordinate system.
+// Segmented buffers are also split at the ORIGINAL buffer's NUMA boundaries
+// and publish existing cpu:N names, which older consumers already understand.
+// Other names are preserved. max_mr_size == 0 means no device size limit.
+// Return no entries for an empty/overflowing range or invalid segments label.
+std::vector<MemoryLocationEntry> planMemoryRegistration(
+    uint64_t start, size_t length, const std::string &location,
+    size_t max_mr_size);
+
 }  // namespace mooncake
 
 #endif  // MEMORY_LOCATION_H
