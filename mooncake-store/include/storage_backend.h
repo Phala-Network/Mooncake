@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -214,9 +215,9 @@ struct BucketBackendConfig {
     int64_t max_total_size = 0;  // 0 = unlimited; evict when total_size_
                                  // exceeds this threshold (bytes)
 
-    // Hard cap on *actual on-disk* bytes of the offload directory, measured by
-    // scanning real file allocation (stat st_blocks), NOT the in-memory
-    // total_size_. 0 = disabled.
+    // Admission cap on *actual on-disk* bytes of the offload directory,
+    // measured by scanning real file allocation (stat st_blocks), NOT the
+    // in-memory total_size_. 0 = disabled.
     //
     // Why a separate, disk-measured cap: total_size_ is decremented per object
     // on eviction/delete, but a 256 MB bucket file is only removed once *all*
@@ -228,15 +229,20 @@ struct BucketBackendConfig {
     // so it never fires either. This cap scans the actual directory (the same
     // st_blocks basis kubelet's emptyDir accounting uses), so it matches what
     // actually triggers pod eviction. Set it to the real quota minus headroom.
+    // Longer scan intervals require an exclusively owned directory. Other
+    // backends' writes are only sampled by scans. Reservations round files to
+    // filesystem allocation units; unusual preallocation can exceed them.
+    // Incremental post-write accounting rejects publication on excess, but
+    // cannot undo transient allocation. This does not replace a kernel quota.
     int64_t max_physical_bytes = 0;
 
-    // How long ActualDiskBytesUsedLocked() caches its directory-scan result
-    // (milliseconds). Bounds scan cost under a high offload rate; larger =
-    // cheaper but a staler physical bound (disk may momentarily exceed the cap
-    // by roughly one interval's worth of writes), smaller = tighter but scans
-    // more often. <=0 disables caching (scan every check). Only relevant when
-    // max_physical_bytes > 0.
+    // Reconcile with the whole subtree at this interval; <=0 disables reuse.
+    // The default retains the shared-directory scan cache. Incremental mode
+    // accounts backend mutations immediately and permits longer intervals.
     int64_t disk_scan_cache_ms = 500;
+
+    // Opt in only when this backend exclusively owns its storage directory.
+    bool incremental_physical_accounting = false;
 
     // Opt-in POSIX O_DIRECT writes for bucket DATA only. Metadata and read
     // mode remain unchanged; no io_uring dependency or security-policy change.
@@ -1074,7 +1080,7 @@ class BucketStorageBackend : public StorageBackendInterface {
      * Used by write rollback and startup recovery of incomplete buckets.
      * @param bucket_id The bucket ID whose files should be deleted.
      */
-    void CleanupOrphanedBucket(int64_t bucket_id);
+    bool CleanupOrphanedBucket(int64_t bucket_id);
 
     /**
      * @brief Rollback a committed bucket from the local index when
@@ -1107,6 +1113,7 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<std::string> write_keys;
         int64_t evicted_size = 0;
         int64_t write_size = 0;
+        int64_t physical_write_size = 0;
     };
 
     /**
@@ -1118,7 +1125,8 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @return PendingEviction with all keys and bucket metadata removed.
      */
     tl::expected<PendingEviction, ErrorCode> PrepareEviction(
-        int64_t required_size, const std::vector<std::string>& write_keys = {});
+        int64_t required_size, const std::vector<std::string>& write_keys = {},
+        int64_t physical_write_size = 0);
 
     void RestorePreparedEviction(PendingEviction&& pending);
 
@@ -1127,7 +1135,7 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     void CommitPreparedEviction(const PendingBucket& bucket);
 
-    void ReleasePreparedWrite(const PendingEviction& pending);
+    void ReleasePreparedWrite(PendingEviction& pending);
 
     void ReleasePreparedWriteLocked(const PendingEviction& pending);
 
@@ -1148,15 +1156,26 @@ class BucketStorageBackend : public StorageBackendInterface {
      * This is ground truth — the same block-based accounting kubelet uses for
      * emptyDir sizeLimit — so it captures bucket files that linger after their
      * objects are logically evicted (which the in-memory total_size_ misses).
-     * Result is cached for bucket_backend_config_.disk_scan_cache_ms to bound
-     * the scan cost regardless of offload rate. Caller must hold mutex_.
+     * Caller holds physical_mutex_, never mutex_. File mutations use the same
+     * lock; incremental mode updates this ledger after closing files. Pending
+     * writes stay separately reserved across a scan. Returns -1 on scan
+     * failure.
      */
-    int64_t ActualDiskBytesUsedLocked() const;
+    int64_t ActualDiskBytesUsedLocked();
+
+    int64_t BucketPhysicalBytes(int64_t bucket_id);
+    void AccountBucketMutationLocked(int64_t bucket_id, int64_t before);
+    bool PhysicalCapExceededLocked(uint64_t freed = 0) const;
+    void ReleasePhysicalWriteLocked(PendingEviction& pending);
 
     // Cached result of ActualDiskBytesUsedLocked() and when it was taken.
-    mutable int64_t cached_disk_bytes_ GUARDED_BY(mutex_) = -1;
-    mutable std::chrono::steady_clock::time_point cached_disk_bytes_at_
-        GUARDED_BY(mutex_);
+    int64_t cached_disk_bytes_ GUARDED_BY(physical_mutex_) = -1;
+    std::chrono::steady_clock::time_point cached_disk_bytes_at_
+        GUARDED_BY(physical_mutex_);
+    // Failed, unsynced writes whose cleanup also fails retain their reserve
+    // until restart; a stat-only reconciliation cannot settle delayed growth.
+    int64_t pending_physical_write_size_ GUARDED_BY(physical_mutex_) = 0;
+    uint64_t physical_allocation_unit_ = 4096;
 
     /**
      * @brief Phase 2 of eviction: delete persisted metadata for each evicted
@@ -1191,6 +1210,22 @@ class BucketStorageBackend : public StorageBackendInterface {
     // -2 disables injection; -1 is an IO error; >=0 is a write result.
     void SetDirectWriteResultForTest(int64_t result) {
         direct_write_result_for_test_.store(result);
+    }
+
+    // Set before starting concurrent operations. Hooks do not hold mutex_.
+    void SetPhysicalScanHookForTest(std::function<bool()> hook) {
+        physical_scan_hook_for_test_ = std::move(hook);
+    }
+
+    void SetBeforeBucketWriteHookForTest(std::function<void()> hook) {
+        before_bucket_write_hook_for_test_ = std::move(hook);
+    }
+
+    std::optional<BucketReadGuard> AcquireReadGuardForTest(int64_t bucket_id) {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        auto it = buckets_.find(bucket_id);
+        if (it == buckets_.end()) return std::nullopt;
+        return BucketReadGuard(it->second);
     }
 
    private:
@@ -1228,10 +1263,14 @@ class BucketStorageBackend : public StorageBackendInterface {
      * - total_size_: cumulative data size of all stored objects
      */
     mutable SharedMutex mutex_;
-    // Prepare-only serialization. Lock order: eviction_prepare_mutex_, then
-    // mutex_. No holder of mutex_ may acquire eviction_prepare_mutex_, and
-    // notification/Commit/Restore/Finalize never acquire this mutex.
+    // Lock order: eviction_prepare_mutex_ -> physical_mutex_ -> mutex_.
+    // Readers never acquire physical_mutex_. Neither IO lock is held across
+    // master callbacks or read-guard draining. Never acquire either while
+    // holding mutex_; notification/Commit/Restore do not acquire prepare.
     Mutex eviction_prepare_mutex_;
+    mutable Mutex physical_mutex_;
+    std::function<bool()> physical_scan_hook_for_test_;
+    std::function<void()> before_bucket_write_hook_for_test_;
     mutable Mutex iterator_mutex_;
     std::string storage_path_;
     int64_t total_size_ GUARDED_BY(mutex_) = 0;

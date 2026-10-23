@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/uio.h>
 #include <errno.h>
 #include <cstdint>
@@ -136,6 +137,10 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
     config.disk_scan_cache_ms =
         Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS",
                           config.disk_scan_cache_ms);
+
+    config.incremental_physical_accounting = Environ::GetBool(
+        "MOONCAKE_OFFLOAD_BUCKET_INCREMENTAL_PHYSICAL_ACCOUNTING",
+        config.incremental_physical_accounting);
 
     config.direct_io_write = Environ::GetBool(
         "MOONCAKE_OFFLOAD_BUCKET_DIRECT_IO_WRITE", config.direct_io_write);
@@ -1771,7 +1776,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
 
     // Phase 1: eviction — remove oldest buckets from metadata maps to make
     // room. Must notify master BEFORE deleting files (Phase 2).
-    if (bucket_backend_config_.direct_io_write) {
+    if (bucket_backend_config_.direct_io_write ||
+        bucket_backend_config_.max_physical_bytes > 0) {
         // meta_size is NOT in YLT_REFL(BucketMetadata). Assigning it cannot
         // change the bytes StoreBucketMetadata later serializes.
         std::string encoded_metadata;
@@ -1792,7 +1798,23 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
                         static_cast<int64_t>(
                             align_up(bucket->meta_size, kDirectIOAlignment));
     }
-    auto prepare_result = PrepareEviction(required_size, bucket->keys);
+    int64_t physical_write_size = 0;
+    if (bucket_backend_config_.max_physical_bytes > 0) {
+        const auto unit = physical_allocation_unit_;
+        const uint64_t limit = std::numeric_limits<int64_t>::max();
+        if (static_cast<uint64_t>(bucket->data_size) > limit - unit ||
+            static_cast<uint64_t>(bucket->meta_size) > limit - unit) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const auto data = (bucket->data_size + unit - 1) / unit * unit;
+        const auto meta = (bucket->meta_size + unit - 1) / unit * unit;
+        if (data > limit - meta) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        physical_write_size = static_cast<int64_t>(data + meta);
+    }
+    auto prepare_result =
+        PrepareEviction(required_size, bucket->keys, physical_write_size);
     if (!prepare_result) {
         return tl::make_unexpected(prepare_result.error());
     }
@@ -1803,13 +1825,45 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         return tl::make_unexpected(complete_result.error());
     }
 
-    auto write_bucket_result = WriteBucket(bucket_id, bucket, iovs);
+    if (before_bucket_write_hook_for_test_) {
+        before_bucket_write_hook_for_test_();
+    }
+    auto write_bucket_result = [&]() -> tl::expected<void, ErrorCode> {
+        std::unique_lock<Mutex> physical_lock(physical_mutex_, std::defer_lock);
+        if (bucket_backend_config_.max_physical_bytes > 0) physical_lock.lock();
+        // A failed Finalize may not have freed the projected victim bytes.
+        // Recheck after callbacks and before creating/growing any files.
+        ActualDiskBytesUsedLocked();
+        if (PhysicalCapExceededLocked()) {
+            ReleasePhysicalWriteLocked(pending);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        const auto before = BucketPhysicalBytes(bucket_id);
+        auto written = WriteBucket(bucket_id, bucket, iovs);
+        // WriteBucket's handles are closed. Incremental mode has synced both
+        // data and metadata, including on the buffered path.
+        AccountBucketMutationLocked(bucket_id, before);
+        if (written) ReleasePhysicalWriteLocked(pending);
+        // Allocation rounding is an admission estimate, not an FS quota.
+        // Retain any excess actual charge and refuse to publish this bucket.
+        if (written && PhysicalCapExceededLocked()) {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        return written;
+    }();
     if (!write_bucket_result) {
         LOG(ERROR) << "Failed to write bucket with id: " << bucket_id;
-        ReleasePreparedWrite(pending);
-        if (bucket_backend_config_.direct_io_write) {
-            CleanupOrphanedBucket(bucket_id);
+        bool cleaned = true;
+        if (bucket_backend_config_.direct_io_write ||
+            bucket_backend_config_.max_physical_bytes > 0) {
+            cleaned = CleanupOrphanedBucket(bucket_id);
         }
+        if (!cleaned) {
+            // A failed sync may leave delayed allocation invisible to stat.
+            // Keep this reserve even across scans until startup recovery.
+            pending.physical_write_size = 0;
+        }
+        ReleasePreparedWrite(pending);
         return tl::make_unexpected(write_bucket_result.error());
     }
     VLOG(1) << "Written bucket with id: " << bucket_id;
@@ -2131,6 +2185,18 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         buckets_.clear();
         lru_index_.clear();
         total_size_ = 0;
+        if (bucket_backend_config_.max_physical_bytes > 0) {
+            struct statvfs info;
+            if (::statvfs(storage_path_.c_str(), &info) != 0) {
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            physical_allocation_unit_ =
+                std::max<uint64_t>({4096, info.f_bsize, info.f_frsize});
+            if (physical_allocation_unit_ >
+                std::numeric_limits<int64_t>::max() / 4) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
         int64_t max_bucket_id = BucketIdGenerator::INIT_NEW_START_ID;
 
         for (const auto& entry :
@@ -2201,7 +2267,20 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                     LOG(ERROR) << "Bucket metadata has no valid data file: "
                                << entry.path().string()
                                << ", will delete the bucket's remaining files";
-                    CleanupOrphanedBucket(bucket_id);
+                    // Init has no concurrent writers and already holds
+                    // mutex_; do not acquire physical_mutex_ in reverse order.
+                    for (const auto& path :
+                         {bucket_data_path_res,
+                          GetBucketMetadataPath(bucket_id)}) {
+                        if (!path) continue;
+                        std::error_code cleanup_ec;
+                        fs::remove(path.value(), cleanup_ec);
+                        if (cleanup_ec) {
+                            LOG(WARNING)
+                                << "Init: failed to clean up " << path.value()
+                                << ": " << cleanup_ec.message();
+                        }
+                    }
                     lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);
                     continue;
@@ -2705,6 +2784,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
 
+        if (bucket_backend_config_.max_physical_bytes > 0 &&
+            bucket_backend_config_.incremental_physical_accounting &&
+            !file->datasync()) {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
         // Invalidate cache for this file since content changed
         {
             MutexLocker cache_locker(&file_cache_mutex_);
@@ -2734,8 +2819,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     return {};
 }
 
-void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
+bool BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
     namespace fs = std::filesystem;
+    std::unique_lock<Mutex> physical_lock(physical_mutex_, std::defer_lock);
+    if (bucket_backend_config_.max_physical_bytes > 0) physical_lock.lock();
+    const auto before = BucketPhysicalBytes(bucket_id);
     std::error_code ec;
 
     auto data_path_res = GetBucketDataPath(bucket_id);
@@ -2770,6 +2858,12 @@ void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
                          << ", error: " << ec.message();
         }
     }
+    AccountBucketMutationLocked(bucket_id, before);
+    for (const auto& path : {data_path_res, meta_path_res}) {
+        ec.clear();
+        if (!path || fs::exists(path.value(), ec) || ec) return false;
+    }
+    return true;
 }
 
 void BucketStorageBackend::RollbackCommittedBucket(
@@ -2785,8 +2879,8 @@ void BucketStorageBackend::RollbackCommittedBucket(
         if (bucket_it == buckets_.end()) {
             LOG(WARNING) << "RollbackCommittedBucket: bucket " << bucket_id
                          << " not found in buckets_ — already removed?";
-            // Still clean up disk files in case they are orphaned
-            CleanupOrphanedBucket(bucket_id);
+            // Another deletion may own read guards for this bucket. Its
+            // cleanup owns the files; retain any orphan charge on failure.
             return;
         }
 
@@ -2921,14 +3015,19 @@ BucketStorageBackend::SelectEvictionCandidate(
     }
 }
 
-int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
+int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() {
+    if (bucket_backend_config_.max_physical_bytes <= 0) return 0;
     namespace fs = std::filesystem;
-    auto now = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
     if (cached_disk_bytes_ >= 0 &&
         now - cached_disk_bytes_at_ <
             std::chrono::milliseconds(
                 bucket_backend_config_.disk_scan_cache_ms)) {
         return cached_disk_bytes_;
+    }
+    cached_disk_bytes_ = -1;
+    if (physical_scan_hook_for_test_ && !physical_scan_hook_for_test_()) {
+        return -1;
     }
     int64_t total = 0;
     std::error_code ec;
@@ -2938,32 +3037,34 @@ int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
     fs::recursive_directory_iterator it(storage_path_, ec), end;
     if (ec) {
         // Cannot even open storage_path_. This is a hard safety cap, so fail
-        // CLOSED: report the cap as reached so eviction/rejection engages
-        // instead of letting the disk overflow, and do NOT cache the result
-        // (next call re-scans once the directory is readable again).
+        // CLOSED: do not publish a partial baseline or admit new writes.
         LOG(WARNING) << "[Bucket] physcap disk scan could not open "
                      << storage_path_ << ": " << ec.message()
                      << ", failing closed";
-        return bucket_backend_config_.max_physical_bytes;
+        return -1;
     }
-    for (; it != end; it.increment(ec)) {
-        if (ec) {
-            // Iteration errored partway. Returning the partial total would
-            // under-count and silently open the cap; fail closed and skip
-            // caching so the next call re-scans.
-            LOG(WARNING) << "[Bucket] physcap disk scan error under "
-                         << storage_path_ << ": " << ec.message()
-                         << ", failing closed";
-            return bucket_backend_config_.max_physical_bytes;
-        }
+    for (; it != end;) {
         struct stat st;
         // st_blocks counts 512-byte blocks actually allocated on disk — the
         // same basis as du / kubelet's emptyDir accounting (handles block
-        // rounding; ignores apparent size). A per-entry stat failure (e.g. a
-        // file concurrently deleted during eviction) is skipped best-effort:
-        // that only under-counts by ~one file and avoids spurious fail-closed.
-        if (::stat(it->path().c_str(), &st) == 0) {
-            total += static_cast<int64_t>(st.st_blocks) * 512;
+        // rounding; ignores apparent size). Backend mutations are serialized
+        // with this scan, so even an entry-stat failure must fail closed.
+        if (::stat(it->path().c_str(), &st) != 0 || st.st_blocks < 0 ||
+            st.st_blocks >
+                (std::numeric_limits<int64_t>::max() - total) / 512) {
+            LOG(WARNING)
+                << "[Bucket] physcap entry stat failed, failing closed";
+            return -1;
+        }
+        total += static_cast<int64_t>(st.st_blocks) * 512;
+        it.increment(ec);
+        // increment can both set ec and make it == end. Check here, not at
+        // the next loop body, or an incomplete scan could look successful.
+        if (ec) {
+            LOG(WARNING) << "[Bucket] physcap disk scan error under "
+                         << storage_path_ << ": " << ec.message()
+                         << ", failing closed";
+            return -1;
         }
     }
     cached_disk_bytes_ = total;
@@ -2971,15 +3072,81 @@ int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
     return total;
 }
 
+int64_t BucketStorageBackend::BucketPhysicalBytes(int64_t bucket_id) {
+    if (bucket_backend_config_.max_physical_bytes <= 0) return 0;
+    int64_t total = 0;
+    for (auto path :
+         {GetBucketDataPath(bucket_id), GetBucketMetadataPath(bucket_id)}) {
+        if (!path) return -1;
+        struct stat st;
+        if (::stat(path->c_str(), &st) != 0) {
+            if (errno == ENOENT) continue;
+            return -1;
+        }
+        if (st.st_blocks < 0 ||
+            st.st_blocks >
+                (std::numeric_limits<int64_t>::max() - total) / 512) {
+            return -1;
+        }
+        total += static_cast<int64_t>(st.st_blocks) * 512;
+    }
+    return total;
+}
+
+void BucketStorageBackend::AccountBucketMutationLocked(int64_t bucket_id,
+                                                       int64_t before) {
+    if (bucket_backend_config_.max_physical_bytes <= 0 ||
+        !bucket_backend_config_.incremental_physical_accounting)
+        return;
+    const auto after = BucketPhysicalBytes(bucket_id);
+    if (before < 0 || after < 0 || cached_disk_bytes_ < before ||
+        after > std::numeric_limits<int64_t>::max() -
+                    (cached_disk_bytes_ - before)) {
+        cached_disk_bytes_ = -1;
+        return;
+    }
+    cached_disk_bytes_ += after - before;
+}
+
+bool BucketStorageBackend::PhysicalCapExceededLocked(uint64_t freed) const {
+    if (bucket_backend_config_.max_physical_bytes <= 0) return false;
+    if (cached_disk_bytes_ < 0) return true;
+    const auto used = static_cast<uint64_t>(cached_disk_bytes_);
+    const auto remaining = used > freed ? used - freed : 0;
+    const auto cap =
+        static_cast<uint64_t>(bucket_backend_config_.max_physical_bytes);
+    return remaining > cap ||
+           static_cast<uint64_t>(pending_physical_write_size_) >
+               cap - remaining;
+}
+
+void BucketStorageBackend::ReleasePhysicalWriteLocked(
+    PendingEviction& pending) {
+    if (bucket_backend_config_.max_physical_bytes <= 0) return;
+    CHECK_GE(pending_physical_write_size_, pending.physical_write_size);
+    pending_physical_write_size_ -= pending.physical_write_size;
+    pending.physical_write_size = 0;
+}
+
 tl::expected<BucketStorageBackend::PendingEviction, ErrorCode>
 BucketStorageBackend::PrepareEviction(
-    int64_t required_size, const std::vector<std::string>& write_keys) {
+    int64_t required_size, const std::vector<std::string>& write_keys,
+    int64_t physical_write_size) {
     PendingEviction result;
-    // Destroy the physical snapshot set after both locks have been released.
+    // Legacy scan caching needs its original snapshot rule; incremental
+    // accounting already includes every published bucket. Destroy outside
+    // locks.
     std::unordered_set<int64_t> physical_snapshot_bucket_ids;
     // Preserve Prepare-to-Prepare admission/snapshot ordering while allowing
     // readers between bucket transitions. Never hold this across callbacks.
     MutexLocker prepare_lock(&eviction_prepare_mutex_);
+    std::unique_lock<Mutex> physical_lock(physical_mutex_, std::defer_lock);
+    if (bucket_backend_config_.max_physical_bytes > 0) physical_lock.lock();
+    // The only O(directory entries) operation has no metadata lock. Backend
+    // writes/deletes cannot change the snapshot; BatchLoad can still progress.
+    if (ActualDiskBytesUsedLocked() < 0) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
     SharedMutexLocker lock(&mutex_);
 
     if (!write_keys.empty()) {
@@ -2991,13 +3158,25 @@ BucketStorageBackend::PrepareEviction(
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
         }
+        if (physical_write_size < 0 ||
+            physical_write_size > std::numeric_limits<int64_t>::max() -
+                                      pending_physical_write_size_) {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
         result.write_keys = write_keys;
         result.write_size = required_size;
+        result.physical_write_size = physical_write_size;
+        pending_physical_write_size_ += physical_write_size;
         pending_write_size_ += required_size;
         pending_write_keys_.insert(write_keys.begin(), write_keys.end());
     }
 
     if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
+        if (PhysicalCapExceededLocked()) {
+            ReleasePhysicalWriteLocked(result);
+            ReleasePreparedWriteLocked(result);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
         return result;
     }
 
@@ -3006,10 +3185,8 @@ BucketStorageBackend::PrepareEviction(
     // re-checking disk space inside the loop would yield the same result
     // every iteration and is unnecessary.
     //
-    // When disk is full, we calculate the space deficit and accumulate
-    // the estimated freed space (data_size + meta_size) per evicted
-    // bucket. Due to block alignment, actual disk usage >= data_size +
-    // meta_size, so this is a safe lower bound -- we will not under-evict.
+    // When disk is full, accumulate victim allocation against its deficit.
+    // With the physical cap enabled this uses stat, including sparse files.
     bool initial_disk_full = false;
     uint64_t deficit = 0;
     {
@@ -3048,37 +3225,20 @@ BucketStorageBackend::PrepareEviction(
     uint64_t accumulated_freed_space = 0;
     const int64_t synthetic_required_size =
         write_keys.empty() ? required_size : 0;
-    // On-disk footprint of the incoming write (~required_size); 0 for
-    // watermark-driven eviction, which has no incoming write. Added to the
-    // physical check below so we free enough room for THIS write, not merely
-    // enough to bring current usage back under the cap.
-    const int64_t incoming_physical_size =
-        write_keys.empty() ? 0 : required_size;
-
-    // Ground-truth physical usage of the offload directory (cached),
-    // snapshotted once. As buckets are selected for eviction their files get
-    // deleted in the later FinalizeEviction, so (physical_used_start -
-    // accumulated_freed_space) projects the physical bytes that will remain
-    // after this round.
+    // All admitted but unwritten buckets remain physically reserved, even
+    // across a new scan or a different bucket's metadata commit.
     const int64_t physical_used_start =
-        bucket_backend_config_.max_physical_bytes > 0
-            ? ActualDiskBytesUsedLocked()
-            : 0;
+        bucket_backend_config_.max_physical_bytes > 0 ? cached_disk_bytes_ : 0;
     // True when the projected physical usage after this round — real disk usage
     // minus what we free here, plus the incoming write — would still exceed the
     // physical cap. Shared by the in-loop "keep evicting" test and the
     // post-loop "reject the write" test.
     const auto phys_over_cap = [&](uint64_t freed) {
-        return bucket_backend_config_.max_physical_bytes > 0 &&
-               physical_used_start + incoming_physical_size -
-                       static_cast<int64_t>(freed) >
-                   bucket_backend_config_.max_physical_bytes;
+        return PhysicalCapExceededLocked(freed);
     };
-
-    // Only entry-visible buckets may reduce this round's physical snapshot.
-    // A write can finish and become visible during a reader window; its files
-    // may not have existed in physical_used_start or initial free space.
-    if (bucket_backend_config_.max_physical_bytes > 0 || initial_disk_full) {
+    if ((!bucket_backend_config_.incremental_physical_accounting ||
+         bucket_backend_config_.max_physical_bytes <= 0) &&
+        (bucket_backend_config_.max_physical_bytes > 0 || initial_disk_full)) {
         physical_snapshot_bucket_ids.reserve(buckets_.size());
         for (const auto& [id, meta] : buckets_) {
             physical_snapshot_bucket_ids.insert(id);
@@ -3173,7 +3333,15 @@ BucketStorageBackend::PrepareEviction(
             pending_eviction_keys_.insert(key);
         }
         pending_eviction_size_ += evicted_size;
-        if (physical_snapshot_bucket_ids.count(evict_id) != 0) {
+        // physical_mutex_ prevents file growth/deletion during this Prepare.
+        // Even a newly published bucket's files were already in the ledger;
+        // only their measured allocation can be discounted, never a logical
+        // estimate for an unmeasured, sparse, or failed-stat bucket.
+        if (bucket_backend_config_.max_physical_bytes > 0 &&
+            bucket_backend_config_.incremental_physical_accounting) {
+            accumulated_freed_space += static_cast<uint64_t>(
+                std::max<int64_t>(BucketPhysicalBytes(evict_id), 0));
+        } else if (physical_snapshot_bucket_ids.count(evict_id) != 0) {
             accumulated_freed_space +=
                 static_cast<uint64_t>(evict_meta->data_size) +
                 static_cast<uint64_t>(evict_meta->meta_size);
@@ -3200,6 +3368,7 @@ BucketStorageBackend::PrepareEviction(
     const bool phys_exceeded = phys_over_cap(accumulated_freed_space);
     if (!write_keys.empty() && (quota_exceeded || phys_exceeded)) {
         lock.unlock();
+        if (physical_lock.owns_lock()) physical_lock.unlock();
         RestorePreparedEviction(std::move(result));
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -3276,12 +3445,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::CompletePreparedEviction(
     return {};
 }
 
-void BucketStorageBackend::ReleasePreparedWrite(
-    const PendingEviction& pending) {
-    if (pending.write_size == 0) {
-        return;
-    }
-
+void BucketStorageBackend::ReleasePreparedWrite(PendingEviction& pending) {
+    std::unique_lock<Mutex> physical_lock(physical_mutex_, std::defer_lock);
+    if (bucket_backend_config_.max_physical_bytes > 0) physical_lock.lock();
+    ReleasePhysicalWriteLocked(pending);
     SharedMutexLocker lock(&mutex_);
     ReleasePreparedWriteLocked(pending);
 }
@@ -3315,7 +3482,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
         std::error_code ec;
         auto meta_path = GetBucketMetadataPath(bucket_id);
         if (meta_path) {
+            std::unique_lock<Mutex> physical_lock(physical_mutex_,
+                                                  std::defer_lock);
+            if (bucket_backend_config_.max_physical_bytes > 0)
+                physical_lock.lock();
+            const auto before = BucketPhysicalBytes(bucket_id);
             fs::remove(meta_path.value(), ec);
+            AccountBucketMutationLocked(bucket_id, before);
             if (ec && ec != std::errc::no_such_file_or_directory) {
                 LOG(ERROR)
                     << "FinalizeEviction: failed to remove metadata file: "
@@ -3357,6 +3530,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
         ec.clear();
         auto data_path = GetBucketDataPath(bucket_id);
         if (data_path) {
+            std::unique_lock<Mutex> physical_lock(physical_mutex_,
+                                                  std::defer_lock);
+            if (bucket_backend_config_.max_physical_bytes > 0)
+                physical_lock.lock();
+            const auto before = BucketPhysicalBytes(bucket_id);
             // Evict the cached file handle before deleting the file to prevent
             // stale handles from accumulating in the cache.
             {
@@ -3364,6 +3542,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
                 file_cache_.erase(data_path.value());
             }
             fs::remove(data_path.value(), ec);
+            AccountBucketMutationLocked(bucket_id, before);
             if (ec && ec != std::errc::no_such_file_or_directory) {
                 // File remains on disk as an orphan; disk space is not freed.
                 // WriteBucket may then fail with ENOSPC. Orphan will be cleaned
@@ -3382,10 +3561,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
     {
         VLOG(1) << "[Evict] finalized: attempted=1"
                 << " cleanup_failed=" << cleanup_failed_count;
-        // Files were just deleted; force the next physical-usage query to
-        // rescan rather than return the now-stale (higher) cached value.
-        {
-            SharedMutexLocker lock(&mutex_);
+        if (!bucket_backend_config_.incremental_physical_accounting) {
+            MutexLocker physical_lock(&physical_mutex_);
             cached_disk_bytes_ = -1;
         }
     }
@@ -3512,10 +3689,17 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
     }
 
     // Step 3: Safe to delete files now - no readers are using them
+    std::unique_lock<Mutex> physical_lock(physical_mutex_, std::defer_lock);
+    if (bucket_backend_config_.max_physical_bytes > 0) physical_lock.lock();
+    const auto before = BucketPhysicalBytes(bucket_id);
     std::error_code ec;
 
     auto data_path_res = GetBucketDataPath(bucket_id);
     if (data_path_res) {
+        {
+            MutexLocker cache_locker(&file_cache_mutex_);
+            file_cache_.erase(data_path_res.value());
+        }
         fs::remove(data_path_res.value(), ec);
         if (ec && ec != std::errc::no_such_file_or_directory) {
             LOG(WARNING) << "DeleteBucket: failed to remove data file: "
@@ -3534,6 +3718,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
                          << ", error: " << ec.message();
         }
     }
+    AccountBucketMutationLocked(bucket_id, before);
 
     LOG(INFO) << "DeleteBucket: successfully deleted bucket_id=" << bucket_id
               << ", keys_removed=" << keys_to_remove.size();
@@ -3590,6 +3775,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
         LOG(ERROR) << "Write size mismatch for: " << meta_path
                    << ", expected: " << str.size()
                    << ", got: " << write_result.value();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (bucket_backend_config_.max_physical_bytes > 0 &&
+        bucket_backend_config_.incremental_physical_accounting &&
+        !file->datasync()) {
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     metadata->meta_size = str.size();
@@ -3763,6 +3953,8 @@ BucketStorageBackend::GetFileInstance() const {
     // Create a temporary file to get access to the file instance
     // This is used for external buffer registration with UringFile
     namespace fs = std::filesystem;
+    std::unique_lock<Mutex> physical_lock(physical_mutex_, std::defer_lock);
+    if (bucket_backend_config_.max_physical_bytes > 0) physical_lock.lock();
 
     std::string temp_path =
         (fs::path(storage_path_) / "temp_for_registration").string();

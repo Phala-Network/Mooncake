@@ -3,6 +3,9 @@
 ## Scope
 Official Mooncake `e5598b0992cc258b06d22f24d875480e8931a28e`, with only the current opt-in bucket DATA-write change. No prior custom HA code. CPU development is not production or GPU acceptance.
 
+For the subsequent physical accounting repair, see
+[Bucket physical-cap admission](../BUCKET-PHYSICAL-CAP.md).
+
 ## Reproducible dependencies
 `Dockerfile` and `install-deps.sh` declare the pinned SGLang base, AWS SDK 1.11.908 at `765f3eec667c66643522a37278e7920e48b0b821`, verified Go 1.25.10 tarball and pybind11 commit. On the isolated builder the same script installs these in a reusable capped container. Future accepted runtime bytes must be assembled by Dockerfile, not by modifying a running service.
 

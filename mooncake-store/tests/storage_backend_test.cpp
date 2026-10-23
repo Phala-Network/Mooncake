@@ -18,6 +18,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
+#include <condition_variable>
+#include <future>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -5270,6 +5272,11 @@ TEST_F(StorageBackendTest, BucketDirectWriteDatasyncFailureNeverPublishes) {
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;
     bucket_config.direct_io_write = true;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.max_total_size = 1024 * 1024;
+    bucket_config.max_physical_bytes = 16 * 1024;
+    bucket_config.disk_scan_cache_ms = 60000;
+    bucket_config.incremental_physical_accounting = true;
     BucketStorageBackend writer(config, bucket_config);
     ASSERT_TRUE(writer.Init());
     writer.SetDirectWriteDatasyncFailureForTest(true);
@@ -5705,5 +5712,516 @@ TEST_F(StorageBackendTest,
     BoundedExists(backend, "incoming", false);
     // Same incoming key and capacity can be reserved again after rollback.
     EXPECT_TRUE(BoundedPut(backend, {"incoming"}, 20 * 1024));
+}
+
+namespace {
+// Gates the real backend scanner/writer rather than approximating its locks
+// with a second implementation. Tests always release the gate before joining.
+class PhysicalTestGate {
+   public:
+    void ArriveAndWait() {
+        std::unique_lock lock(mutex_);
+        entered_ = true;
+        cv_.notify_all();
+        cv_.wait(lock, [&] { return released_; });
+    }
+
+    bool WaitForArrival() {
+        std::unique_lock lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(5),
+                            [&] { return entered_; });
+    }
+
+    void Release() {
+        std::lock_guard lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool entered_ = false;
+    bool released_ = false;
+};
+
+BucketBackendConfig PhysicalConfig(int64_t cap, int64_t cache_ms = 60000) {
+    auto config = BoundedConfig();
+    config.max_physical_bytes = cap;
+    config.disk_scan_cache_ms = cache_ms;
+    config.direct_io_write = true;
+    config.incremental_physical_accounting = true;
+    return config;
+}
+
+int64_t PhysicalBytes(const fs::path& root) {
+    int64_t bytes = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(root)) {
+        struct stat st{};
+        if (::stat(entry.path().c_str(), &st) != 0) {
+            ADD_FAILURE() << "stat failed for " << entry.path();
+            return -1;
+        }
+        bytes += static_cast<int64_t>(st.st_blocks) * 512;
+    }
+    return bytes;
+}
+
+bool WaitForAbsent(BucketStorageBackend& backend, const std::string& key) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+        auto exists = backend.IsExist(key);
+        if (exists && !exists.value()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
+}  // namespace
+
+TEST_F(StorageBackendTest, BucketPhysicalIncrementalAccountingRequiresOptIn) {
+    ScopedEnvVar option{
+        "MOONCAKE_OFFLOAD_BUCKET_INCREMENTAL_PHYSICAL_ACCOUNTING"};
+    ScopedEnvVar scan_cache{"MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS"};
+    EXPECT_FALSE(
+        BucketBackendConfig::FromEnvironment().incremental_physical_accounting);
+    EXPECT_EQ(BucketBackendConfig::FromEnvironment().disk_scan_cache_ms, 500);
+    option.Set("true");
+    EXPECT_TRUE(
+        BucketBackendConfig::FromEnvironment().incremental_physical_accounting);
+    option.Set("false");
+    EXPECT_FALSE(
+        BucketBackendConfig::FromEnvironment().incremental_physical_accounting);
+}
+
+TEST_F(StorageBackendTest, BucketPhysicalLegacyFinalizeInvalidatesCachedScan) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    auto bucket_config = PhysicalConfig(8192);
+    bucket_config.incremental_physical_accounting = false;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    int scans = 0;
+    backend.SetPhysicalScanHookForTest([&] {
+        ++scans;
+        return true;
+    });
+    ASSERT_TRUE(BoundedPut(backend, {"old"}));
+    EXPECT_EQ(scans, 1);
+    ASSERT_TRUE(backend.EvictAboveDiskWatermark(
+        0, 0, [](const auto&) -> tl::expected<void, ErrorCode> { return {}; }));
+    ASSERT_TRUE(BoundedPut(backend, {"new"}));
+    EXPECT_EQ(scans, 2)
+        << "Legacy mode must rescan after finalized file deletion";
+    EXPECT_LE(PhysicalBytes(data_path), 8192);
+}
+
+TEST_F(StorageBackendTest, BucketPhysicalSlowScanAllowsRealBatchLoad) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, PhysicalConfig(1024 * 1024, 0));
+    ASSERT_TRUE(backend.Init());
+    ASSERT_TRUE(BoundedPut(backend, {"resident"}));
+
+    PhysicalTestGate scan;
+    backend.SetPhysicalScanHookForTest([&] {
+        scan.ArriveAndWait();
+        return true;
+    });
+    auto offload = std::async(
+        std::launch::async, [&] { return BoundedPut(backend, {"incoming"}); });
+    const bool scan_entered = scan.WaitForArrival();
+    std::string loaded(16, '\0');
+    auto read = std::async(std::launch::async, [&] {
+        std::unordered_map<std::string, Slice> slices{
+            {"resident", {loaded.data(), loaded.size()}}};
+        return backend.BatchLoad(slices);
+    });
+    const bool read_completed_during_scan =
+        read.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    scan.Release();
+    auto offload_result = offload.get();
+    auto read_result = read.get();
+
+    EXPECT_TRUE(scan_entered);
+    EXPECT_TRUE(read_completed_during_scan)
+        << "BatchLoad metadata lookup waited for the directory scan";
+    ASSERT_TRUE(read_result);
+    EXPECT_EQ(loaded, std::string(16, 'v'));
+    ASSERT_TRUE(offload_result);
+}
+
+TEST_F(StorageBackendTest,
+       BucketPhysicalPendingWritesRemainReservedAcrossScan) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, PhysicalConfig(8192, 0));
+    ASSERT_TRUE(backend.Init());
+    PhysicalTestGate write;
+    std::atomic<int> write_calls{0};
+    backend.SetBeforeBucketWriteHookForTest([&] {
+        if (write_calls.fetch_add(1) == 0) write.ArriveAndWait();
+    });
+    auto first = std::async(std::launch::async,
+                            [&] { return BoundedPut(backend, {"first"}); });
+    const bool write_entered = write.WaitForArrival();
+    auto second = std::async(std::launch::async,
+                             [&] { return BoundedPut(backend, {"second"}); });
+    const bool second_completed_before_write =
+        second.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    const bool no_files_before_write = fs::is_empty(data_path);
+    write.Release();
+    auto first_result = first.get();
+    auto second_result = second.get();
+
+    EXPECT_TRUE(write_entered);
+    EXPECT_TRUE(second_completed_before_write);
+    EXPECT_TRUE(no_files_before_write);
+    ASSERT_TRUE(first_result);
+    ASSERT_FALSE(second_result);
+    EXPECT_EQ(second_result.error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_LE(PhysicalBytes(data_path), 8192);
+    // A rejected transaction must release both its key and its physical token.
+    ASSERT_TRUE(backend.DeleteBucket(first_result.value()));
+    ASSERT_TRUE(BoundedPut(backend, {"second"}));
+    EXPECT_LE(PhysicalBytes(data_path), 8192);
+}
+
+TEST_F(StorageBackendTest, BucketPhysicalCachedScanTracksCommittedWrites) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, PhysicalConfig(8192));
+    ASSERT_TRUE(backend.Init());
+    int scans = 0;
+    backend.SetPhysicalScanHookForTest([&] {
+        ++scans;
+        return true;
+    });
+    ASSERT_TRUE(BoundedPut(backend, {"first"}));
+    std::vector<std::string> notified;
+    auto replacement = BoundedPut(
+        backend, {"second"}, 16,
+        [&](const auto& keys) -> tl::expected<void, ErrorCode> {
+            notified.insert(notified.end(), keys.begin(), keys.end());
+            return {};
+        });
+    ASSERT_TRUE(replacement);
+    EXPECT_EQ(notified, std::vector<std::string>{"first"});
+    EXPECT_EQ(scans, 1) << "Internal writes/deletes should update the budget";
+    BoundedExists(backend, "first", false);
+    BoundedExists(backend, "second", true);
+    EXPECT_LE(PhysicalBytes(data_path), 8192);
+}
+
+TEST_F(StorageBackendTest,
+       BucketPhysicalBufferedCapIncludesMetadataAllocation) {
+    for (const size_t key_size : {size_t{1}, size_t{4097}}) {
+        const std::string key(key_size, 'k');
+        BucketMetadata metadata{};
+        metadata.data_size = key_size + 1;
+        metadata.keys = {key};
+        metadata.metadatas = {{0, static_cast<int64_t>(key_size), 1}};
+        std::string encoded;
+        struct_pb::to_pb(metadata, encoded);
+        const int64_t reservation =
+            (metadata.data_size + 4095) / 4096 * 4096 +
+            (static_cast<int64_t>(encoded.size()) + 4095) / 4096 * 4096;
+        for (const int deficit : {1, 0}) {
+            SCOPED_TRACE(key_size);
+            SCOPED_TRACE(deficit);
+            FileStorageConfig config;
+            config.storage_filepath = data_path + "/buffered_" +
+                                      std::to_string(key_size) + "_" +
+                                      std::to_string(deficit);
+            fs::create_directory(config.storage_filepath);
+            auto bucket_config = PhysicalConfig(reservation - deficit);
+            bucket_config.direct_io_write = false;
+            BucketStorageBackend backend(config, bucket_config);
+            ASSERT_TRUE(backend.Init());
+            auto result = BoundedPut(backend, {key}, 1);
+            if (deficit != 0) {
+                ASSERT_FALSE(result);
+                EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
+                EXPECT_TRUE(fs::is_empty(config.storage_filepath));
+            } else {
+                ASSERT_TRUE(result);
+                EXPECT_LE(PhysicalBytes(config.storage_filepath), reservation);
+                std::string loaded(1, '\0');
+                std::unordered_map<std::string, Slice> slices{
+                    {key, {loaded.data(), loaded.size()}}};
+                ASSERT_TRUE(backend.BatchLoad(slices));
+                EXPECT_EQ(loaded, "v");
+            }
+        }
+    }
+}
+
+TEST_F(StorageBackendTest, BucketPhysicalScanIncludesNestedOrphans) {
+    const auto nested = fs::path(data_path) / "nested";
+    fs::create_directory(nested);
+    const auto orphan = nested / "untracked.alloc";
+    {
+        std::ofstream file(orphan, std::ios::binary);
+        file << std::string(16 * 1024, 'o');
+        ASSERT_TRUE(file.good());
+    }
+    const int64_t orphan_bytes = PhysicalBytes(data_path);
+    ASSERT_GE(orphan_bytes, 16 * 1024);
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config,
+                                 PhysicalConfig(orphan_bytes + 8192 - 1));
+    ASSERT_TRUE(backend.Init());
+    auto rejected = BoundedPut(backend, {"incoming"});
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::FILE_WRITE_FAIL);
+    BoundedExists(backend, "incoming", false);
+    EXPECT_TRUE(fs::exists(orphan));
+    EXPECT_EQ(PhysicalBytes(data_path), orphan_bytes);
+}
+
+TEST_F(StorageBackendTest, BucketPhysicalScanFailureRejectsAndCanRetry) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, PhysicalConfig(1024 * 1024, 0));
+    ASSERT_TRUE(backend.Init());
+    ASSERT_TRUE(BoundedPut(backend, {"resident"}));
+    backend.SetPhysicalScanHookForTest([] { return false; });
+    bool eviction_called = false;
+    auto rejected =
+        BoundedPut(backend, {"incoming"}, 16,
+                   [&](const auto&) -> tl::expected<void, ErrorCode> {
+                       eviction_called = true;
+                       return {};
+                   });
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_FALSE(eviction_called) << "An unknown scan cannot fund eviction";
+    BoundedExists(backend, "resident", true);
+    backend.SetPhysicalScanHookForTest(nullptr);
+    ASSERT_TRUE(BoundedPut(backend, {"incoming"}));
+}
+
+TEST_F(StorageBackendTest, BucketPhysicalScanOpenFailureDoesNotCacheSuccess) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, PhysicalConfig(8192, 0));
+    ASSERT_TRUE(backend.Init());
+    const fs::path backup = data_path + ".scan_backup";
+    fs::rename(data_path, backup);
+    {
+        std::ofstream root_file(data_path);
+        root_file << "not a directory";
+    }
+    auto rejected = BoundedPut(backend, {"retry"});
+    // Restore the fixture before assertions and before backend destruction.
+    fs::remove(data_path);
+    fs::rename(backup, data_path);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::FILE_WRITE_FAIL);
+    ASSERT_TRUE(BoundedPut(backend, {"retry"}));
+    EXPECT_LE(PhysicalBytes(data_path), 8192);
+}
+
+TEST_F(StorageBackendTest,
+       BucketPhysicalScanEntryStatFailureRejectsAndRetries) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, PhysicalConfig(8192, 0));
+    ASSERT_TRUE(backend.Init());
+    const auto dangling = fs::path(data_path) / "dangling";
+    fs::create_symlink(fs::path(data_path) / "missing", dangling);
+    auto rejected = BoundedPut(backend, {"retry"});
+    const bool link_preserved = fs::is_symlink(dangling);
+    const bool link_removed = fs::remove(dangling);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::FILE_WRITE_FAIL);
+    BoundedExists(backend, "retry", false);
+    EXPECT_TRUE(link_preserved);
+    ASSERT_TRUE(link_removed);
+    ASSERT_TRUE(BoundedPut(backend, {"retry"}));
+    EXPECT_LE(PhysicalBytes(data_path), 8192);
+}
+
+TEST_F(StorageBackendTest, BucketPhysicalFinalizeFailureCannotFundNewWrite) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    auto bucket_config = PhysicalConfig(40 * 1024, 0);
+    bucket_config.max_total_size = 40 * 1024;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init());
+    auto old = BoundedPut(backend, {"old"}, 24 * 1024 - 64);
+    ASSERT_TRUE(old);
+    const auto old_path =
+        fs::path(data_path) / (std::to_string(old.value()) + ".bucket");
+    const auto old_meta =
+        fs::path(data_path) / (std::to_string(old.value()) + ".meta");
+    std::vector<std::string> notified;
+    auto rejected = BoundedPut(
+        backend, {"incoming"}, 24 * 1024 - 64,
+        [&](const auto& keys) -> tl::expected<void, ErrorCode> {
+            notified.insert(notified.end(), keys.begin(), keys.end());
+            // Prepare measured the original regular file. Inject a real
+            // unlink failure only after the victim has been selected, so
+            // this exercises Finalize and the subsequent pre-write check.
+            EXPECT_TRUE(fs::remove(old_path));
+            EXPECT_TRUE(fs::create_directory(old_path));
+            std::ofstream blocker(old_path / "blocker", std::ios::binary);
+            blocker << std::string(24 * 1024, 'o');
+            if (!blocker.good()) {
+                ADD_FAILURE() << "Could not create the deletion blocker";
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            return {};
+        });
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_EQ(notified, std::vector<std::string>{"old"});
+    EXPECT_FALSE(fs::exists(old_meta));
+    EXPECT_TRUE(fs::exists(old_path / "blocker"));
+    BoundedExists(backend, "old", false);
+    BoundedExists(backend, "incoming", false);
+    EXPECT_LE(PhysicalBytes(data_path), bucket_config.max_physical_bytes);
+    // The failed incoming reservation is reusable; the orphan remains charged.
+    ASSERT_TRUE(BoundedPut(backend, {"incoming"}));
+    EXPECT_LE(PhysicalBytes(data_path), bucket_config.max_physical_bytes);
+}
+
+TEST_F(StorageBackendTest, BucketPhysicalDeleteKeepsGuardedBytesCharged) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, PhysicalConfig(8192));
+    ASSERT_TRUE(backend.Init());
+    auto old = BoundedPut(backend, {"old"});
+    ASSERT_TRUE(old);
+    auto guard = backend.AcquireReadGuardForTest(old.value());
+    ASSERT_TRUE(guard);
+    const auto data_file =
+        fs::path(data_path) / (std::to_string(old.value()) + ".bucket");
+    auto deletion = std::async(
+        std::launch::async, [&] { return backend.DeleteBucket(old.value()); });
+    const bool detached = WaitForAbsent(backend, "old");
+    const bool data_remains = fs::exists(data_file);
+    const bool delete_waits = deletion.wait_for(std::chrono::milliseconds(0)) ==
+                              std::future_status::timeout;
+    auto incoming = std::async(
+        std::launch::async, [&] { return BoundedPut(backend, {"incoming"}); });
+    const bool admission_completed_while_guarded =
+        incoming.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    guard.reset();
+    auto deleted = deletion.get();
+    auto rejected = incoming.get();
+
+    EXPECT_TRUE(detached);
+    EXPECT_TRUE(data_remains);
+    EXPECT_TRUE(delete_waits);
+    EXPECT_TRUE(admission_completed_while_guarded)
+        << "A read drain must not hold the physical mutex";
+    ASSERT_TRUE(deleted);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_FALSE(fs::exists(data_file));
+    ASSERT_TRUE(BoundedPut(backend, {"incoming"}));
+    EXPECT_LE(PhysicalBytes(data_path), 8192);
+}
+
+TEST_F(StorageBackendTest, BucketPhysicalFinalizeKeepsGuardedBytesCharged) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, PhysicalConfig(8192));
+    ASSERT_TRUE(backend.Init());
+    auto old = BoundedPut(backend, {"old"});
+    ASSERT_TRUE(old);
+    auto guard = backend.AcquireReadGuardForTest(old.value());
+    ASSERT_TRUE(guard);
+    const auto data_file =
+        fs::path(data_path) / (std::to_string(old.value()) + ".bucket");
+    auto eviction = std::async(std::launch::async, [&] {
+        return backend.EvictAboveDiskWatermark(
+            0, 0,
+            [](const auto&) -> tl::expected<void, ErrorCode> { return {}; });
+    });
+    const bool detached = WaitForAbsent(backend, "old");
+    const bool data_remains = fs::exists(data_file);
+    const bool eviction_waits =
+        eviction.wait_for(std::chrono::milliseconds(0)) ==
+        std::future_status::timeout;
+    auto incoming = std::async(
+        std::launch::async, [&] { return BoundedPut(backend, {"incoming"}); });
+    const bool admission_completed_while_guarded =
+        incoming.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    guard.reset();
+    auto evicted = eviction.get();
+    auto rejected = incoming.get();
+
+    EXPECT_TRUE(detached);
+    EXPECT_TRUE(data_remains);
+    EXPECT_TRUE(eviction_waits);
+    EXPECT_TRUE(admission_completed_while_guarded);
+    ASSERT_TRUE(evicted);
+    EXPECT_EQ(evicted.value(), std::vector<std::string>{"old"});
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_FALSE(fs::exists(data_file));
+    ASSERT_TRUE(BoundedPut(backend, {"incoming"}));
+    EXPECT_LE(PhysicalBytes(data_path), 8192);
+}
+
+TEST_F(StorageBackendTest, BucketPhysicalRollbackKeepsGuardedBytesCharged) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, PhysicalConfig(8192));
+    ASSERT_TRUE(backend.Init());
+    std::optional<BucketReadGuard> guard;
+    std::promise<int64_t> committed;
+    auto committed_id = committed.get_future();
+    std::string value(16, 'v');
+    auto offload = std::async(std::launch::async, [&] {
+        return backend.BatchOffload(
+            {{"rollback", {{value.data(), value.size()}}}},
+            [&](const auto&, auto& metadatas) {
+                const int64_t id = metadatas.front().bucket_id;
+                guard = backend.AcquireReadGuardForTest(id);
+                committed.set_value(id);
+                return ErrorCode::RPC_TIMEOUT;
+            });
+    });
+    const bool reached_commit =
+        committed_id.wait_for(std::chrono::seconds(5)) ==
+        std::future_status::ready;
+    if (!reached_commit) {
+        auto result = offload.get();
+        FAIL() << "Write did not reach the complete handler: "
+               << (result ? ErrorCode::OK : result.error());
+    }
+    const int64_t bucket_id = committed_id.get();
+    const auto data_file =
+        fs::path(data_path) / (std::to_string(bucket_id) + ".bucket");
+    const bool guarded = guard.has_value();
+    const bool detached = WaitForAbsent(backend, "rollback");
+    const bool data_remains = fs::exists(data_file);
+    const bool rollback_waits =
+        offload.wait_for(std::chrono::milliseconds(0)) ==
+        std::future_status::timeout;
+    auto incoming = std::async(
+        std::launch::async, [&] { return BoundedPut(backend, {"incoming"}); });
+    const bool admission_completed_while_guarded =
+        incoming.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    guard.reset();
+    auto rolled_back = offload.get();
+    auto rejected = incoming.get();
+
+    EXPECT_TRUE(guarded);
+    EXPECT_TRUE(detached);
+    EXPECT_TRUE(data_remains);
+    EXPECT_TRUE(rollback_waits);
+    EXPECT_TRUE(admission_completed_while_guarded);
+    ASSERT_FALSE(rolled_back);
+    EXPECT_EQ(rolled_back.error(), ErrorCode::RPC_TIMEOUT);
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_FALSE(fs::exists(data_file));
+    ASSERT_TRUE(BoundedPut(backend, {"rollback"}));
+    EXPECT_LE(PhysicalBytes(data_path), 8192);
 }
 }  // namespace mooncake::test
