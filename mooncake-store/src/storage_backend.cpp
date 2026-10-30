@@ -2453,29 +2453,17 @@ tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
     return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys);
 }
 
-void BucketStorageBackend::ClearUngroupedOffloadingObjects() {
-    MutexLocker locker(&offloading_mutex_);
-    ungrouped_offloading_objects_.clear();
-}
-
-size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
-    MutexLocker locker(&offloading_mutex_);
-    return ungrouped_offloading_objects_.size();
-}
-
 tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
     std::vector<std::vector<std::string>>& buckets_keys) {
-    MutexLocker offloading_locker(&offloading_mutex_);
+    // Every key ends up in a bucket of this call or is skipped for good: the
+    // caller reports a task in no bucket to the master as failed, and the
+    // master drops it, so nothing may be carried over to the next cycle.
     if (offloading_objects.empty()) {
         return {};
     }
-    auto& ungrouped_offloading_objects = ungrouped_offloading_objects_;
-    auto carryover_objects = std::move(ungrouped_offloading_objects);
-    bool carryover_loaded = false;
     auto it = offloading_objects.cbegin();
-    int64_t residue_count = static_cast<int64_t>(offloading_objects.size() +
-                                                 carryover_objects.size());
+    int64_t residue_count = static_cast<int64_t>(offloading_objects.size());
     int64_t total_count = residue_count;
 
     auto is_exist_func =
@@ -2485,35 +2473,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
 
     while (it != offloading_objects.cend()) {
         std::vector<std::string> bucket_keys;
-        std::unordered_map<std::string, int64_t> bucket_objects;
         int64_t bucket_data_size = 0;
-
-        if (!carryover_loaded) {
-            for (const auto& ungrouped_it : carryover_objects) {
-                bucket_data_size += ungrouped_it.second;
-                bucket_keys.push_back(ungrouped_it.first);
-                bucket_objects.emplace(ungrouped_it.first, ungrouped_it.second);
-            }
-            VLOG(1) << "Ungrouped offloading objects have been processed and "
-                       "cleared; count="
-                    << carryover_objects.size();
-            carryover_loaded = true;
-        }
 
         while (static_cast<int64_t>(bucket_keys.size()) <
                bucket_backend_config_.bucket_keys_limit) {
             if (it == offloading_objects.cend()) {
-                // The tail is written this cycle: the caller reports every task
-                // not in a bucket as failed, and the master drops it for good.
                 if (!bucket_keys.empty()) {
                     buckets_keys.push_back(std::move(bucket_keys));
                 }
                 return {};
-            }
-
-            if (carryover_objects.find(it->first) != carryover_objects.end()) {
-                ++it;
-                continue;
             }
 
             if (it->second > bucket_backend_config_.bucket_size_limit) {
@@ -2545,7 +2513,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
 
             bucket_data_size += it->second;
             bucket_keys.push_back(it->first);
-            bucket_objects.emplace(it->first, it->second);
             ++it;
 
             if (bucket_data_size == bucket_backend_config_.bucket_size_limit) {

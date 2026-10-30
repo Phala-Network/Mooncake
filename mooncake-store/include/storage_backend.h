@@ -978,10 +978,6 @@ class BucketStorageBackend : public StorageBackendInterface {
         const std::unordered_map<std::string, int64_t>& offloading_objects,
         std::vector<std::vector<std::string>>& buckets_keys);
 
-    void ClearUngroupedOffloadingObjects();
-
-    size_t UngroupedOffloadingObjectsSize() const;
-
     /**
      * @brief Iterate over the metadata of stored objects starting from a
      * specified bucket.
@@ -1249,10 +1245,6 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::set<std::pair<int64_t, int64_t>> GUARDED_BY(mutex_) lru_index_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
-
-    mutable Mutex offloading_mutex_;
-    std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
-        ungrouped_offloading_objects_;
 
     // File handle cache for UringFile to avoid repeated open/close overhead
     mutable Mutex file_cache_mutex_;
