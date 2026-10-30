@@ -2503,13 +2503,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
         while (static_cast<int64_t>(bucket_keys.size()) <
                bucket_backend_config_.bucket_keys_limit) {
             if (it == offloading_objects.cend()) {
-                for (const auto& bucket_object : bucket_objects) {
-                    ungrouped_offloading_objects.emplace(bucket_object.first,
-                                                         bucket_object.second);
+                // The tail is written this cycle: the caller reports every task
+                // not in a bucket as failed, and the master drops it for good.
+                if (!bucket_keys.empty()) {
+                    buckets_keys.push_back(std::move(bucket_keys));
                 }
-                VLOG(1) << "Add offloading objects to ungrouped pool. "
-                        << "Total ungrouped count: "
-                        << ungrouped_offloading_objects.size();
                 return {};
             }
 
