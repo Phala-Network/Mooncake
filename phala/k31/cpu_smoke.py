@@ -34,7 +34,7 @@ for name in ("torch", "mooncake._ep", "mooncake.buffer_pool"):
 try:
     module = importlib.import_module("mooncake.pg")
     out["official_imports"]["mooncake.pg"] = module.__file__
-except RuntimeError as exc:
+except ImportError as exc:
     # The fixed official base ships torch 2.14.1 and PG bindings for older
     # torch versions. Preserve and report this existing, unused PG limit.
     if "Mooncake PG was not built against torch==" not in str(exc):
