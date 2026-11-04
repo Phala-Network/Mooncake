@@ -6,10 +6,11 @@ redispatch and local worker handoff use the declared GID group; different
 device names are supported. Unknown or missing GIDs fail closed. Unset policy
 retains upstream behavior.
 
-Build with the fixed CUDA 13 SGLang base in `Dockerfile.builder`. Mount an
-isolated task directory at `/opt/testdata/native-build`, put this checkout in
-its `source/` directory, and initialize the pinned `extern/pybind11` submodule.
-Run `bash source/phala/k31/build.sh` in the builder. The script first runs the
+Build with the fixed CUDA 13 SGLang base in `Dockerfile.builder`. Use its
+`native-artifacts` target with `--build-arg NATIVE_SOURCE_REV=<full-commit>`
+and `--output type=local,dest=<task-output-directory>` on a dedicated builder.
+It clones the exact remote commit and pinned pybind11 submodule under
+`/opt/testdata/native-build`. The build script first runs the
 26 hardware-free worker-policy regressions, then builds `store` and `engine`.
 Etcd, Redis and EP builds are disabled; runtime metadata uses
 `P2PHANDSHAKE`.

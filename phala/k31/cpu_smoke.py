@@ -16,6 +16,7 @@ root = Path(sys.argv[1] if len(sys.argv) > 1 else "/opt/testdata/native-build")
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 work = root / "cpu-smoke"
 work.mkdir(parents=True, exist_ok=True)
+(work / "master").mkdir(exist_ok=True)
 
 import mooncake.engine as engine
 import mooncake.store as store_module
