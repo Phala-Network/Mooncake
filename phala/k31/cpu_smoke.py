@@ -51,8 +51,7 @@ with (work / "master.log").open("w") as master_log:
         master = subprocess.Popen(
             [str(installed / "mooncake_master"), "--rpc_address=127.0.0.1",
              "--rpc_port=55051", "--rpc_thread_num=2", "--metrics_host=127.0.0.1",
-             "--metrics_port=55052", "--default_kv_lease_ttl=10ms",
-             "--root_fs_dir=" + str(work / "master"), "--logtostderr=true"],
+             "--metrics_port=55052", "--root_fs_dir=", "--logtostderr=true"],
             cwd=work, stdout=master_log, stderr=subprocess.STDOUT,
         )
         deadline = time.monotonic() + 20
@@ -78,7 +77,8 @@ with (work / "master.log").open("w") as master_log:
             assert provider.get(key) == data
             assert consumer.get(key) == data
             out["objects"].append({"bytes": size, "sha256": hashlib.sha256(data).hexdigest()})
-            assert consumer.remove(key, True) == 0
+            code = consumer.remove(key, True)
+            assert code == 0, ("remove", key, code)
 
         # SGLang uses the registered CPU pointer/batch surface, so check it
         # independently of the Python bytes convenience methods.
