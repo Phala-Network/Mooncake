@@ -28,9 +28,18 @@ out = {"engine": engine.__file__, "store": store_module.__file__, "objects": [],
 
 # Import the official modules that share the native package, after the patched
 # engine/store. No CUDA device or GPU computation is requested.
-for name in ("torch", "mooncake._ep", "mooncake.buffer_pool", "mooncake.pg"):
+for name in ("torch", "mooncake._ep", "mooncake.buffer_pool"):
     module = importlib.import_module(name)
     out.setdefault("official_imports", {})[name] = getattr(module, "__file__", None)
+try:
+    module = importlib.import_module("mooncake.pg")
+    out["official_imports"]["mooncake.pg"] = module.__file__
+except RuntimeError as exc:
+    # The fixed official base ships torch 2.14.1 and PG bindings for older
+    # torch versions. Preserve and report this existing, unused PG limit.
+    if "Mooncake PG was not built against torch==" not in str(exc):
+        raise
+    out["official_pg_baseline_limit"] = str(exc)
 
 master = None
 clients = []

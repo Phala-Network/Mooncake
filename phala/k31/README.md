@@ -26,5 +26,6 @@ Run `cpu_smoke.py` against that installed package in an isolated container with
 no source overlays. It launches the untouched official master on container
 loopback and checks P2P/TCP bytes and registered CPU buffer batch operations
 between a provider and a consumer. It also imports the retained torch/EP/PG
-modules. This verifies CPU API and packaging behavior; hardware RoCE and GPU
-acceptance remain separate runtime gates.
+modules, reporting the fixed base's existing PG/torch compatibility limit
+when present. This verifies CPU API and packaging behavior; hardware RoCE
+and GPU acceptance remain separate runtime gates.
